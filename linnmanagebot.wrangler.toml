@@ -1,0 +1,20 @@
+# Repo: linngamestore/linnmanagebot   (put this file next to your .js as wrangler.toml)
+name = "linnmanagebot"              # MUST equal the Worker name in the dashboard
+main = "linnmanagebot.js"           # <- your file name in the repo
+compatibility_date = "2025-09-01"
+
+[triggers]
+crons = ["*/2 * * * *", "1-59/4 * * * *"]
+
+# Workers AI (receipt reading)
+[ai]
+binding = "AI"
+
+# Service bindings
+[[services]]
+binding = "AUTH_WORKER"
+service = "linngamestore"           # the customer bot Worker above
+
+[[services]]
+binding = "JCPLAYS_PROVIDER"
+service = "jcplays-provider"
