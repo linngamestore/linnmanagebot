@@ -2879,6 +2879,45 @@ async function priceFollowCostNow(env, gameId) {
   } catch (err) { console.error('priceFollowCostNow failed', gameId, err); }
 }
 
+// ---- Cost run notices: a "starting" and a "finished" Telegram message --------------------------------------
+// The Cost digest (costDigestAdd) is ONE message that is EDITED in place - and Telegram never notifies for an
+// edit, so a Cost change used to arrive silently. These two are brand-new messages (they DO notify):
+//   * "starting"  - sent right BEFORE the first Cost change of a run is saved;
+//   * "finished"  - sent when the run has been through every game (what changed + any problems).
+// A run with no Cost change stays silent (the daily summary still says "No Cost changes found").
+// Worker variable COST_NOTIFY_ALL = 1 sends "starting"/"finished" for EVERY cycle, even without changes.
+function costNotifyAll(env) {
+  const v = String((env && env.COST_NOTIFY_ALL) || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'on' || v === 'yes';
+}
+function costClock(ms) {
+  const d = new Date((ms || Date.now()) + YANGON_OFFSET_MINUTES * 60000);
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+async function costNoticeSend(env, text) {
+  try { const r = await tgSendReliable(env, { chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML', text }); return !!(r && r.ok); }
+  catch (e) { console.error('Cost notice failed:', (e && e.message) || e); return false; }
+}
+function costStartText(title, line) {
+  return `🔄 <b>${esc(title)} — starting</b>\n${line}\n🕐 ${costClock(Date.now())} (Yangon)`;
+}
+function costFinishText(title, o) {
+  const names = (Array.isArray(o.names) ? o.names : []).slice(0, 12);
+  const more = (Array.isArray(o.names) ? o.names.length : 0) - names.length;
+  const body = Number(o.packages) > 0
+    ? `${o.packages} package(s) in ${o.games} game(s) updated · Cost only, Price unchanged`
+    : 'No Cost changes found';
+  const warn = [];
+  if (Number(o.unreachable)) warn.push(`⚠️ ${o.unreachable} check(s) failed (provider not answering)`);
+  if (Number(o.held)) warn.push(`⏸ ${o.held} big Cost jump(s) held for confirmation`);
+  if (Number(o.skipped)) warn.push(`⚠️ ${o.skipped} game(s) skipped (kept failing)`);
+  if (Number(o.partial)) warn.push(`⚠️ ${o.partial} game(s) only partly checked (one provider did not answer)`);
+  return `✅ <b>${esc(title)} — finished</b>\nChecked ${o.checked} game(s) · ${body}`
+    + (names.length ? `\n${names.map(n => '• ' + esc(n)).join('\n')}${more > 0 ? `\n… +${more} more` : ''}` : '')
+    + (warn.length ? '\n' + warn.join('\n') : '')
+    + (o.started ? `\n🕐 ${costClock(o.started)} → ${costClock(Date.now())} (Yangon)` : '');
+}
+
 async function runContinuousCostTick(env, st, todayStr) {
   const nowMs = Date.now();
   const c = (st.cont && typeof st.cont === 'object') ? st.cont : {};
@@ -2891,6 +2930,17 @@ async function runContinuousCostTick(env, st, todayStr) {
     : { checked: 0, games: 0, packages: 0, unreachable: 0, partial: 0, held: 0 };
   let cycUnreachable = Number(c.cycUnreachable) || 0;
   let lastWarnAt = Number(c.lastWarnAt) || 0;
+  // Per-cycle run notice state: open = the "starting" message was sent and "finished" is still owed.
+  const run = {
+    open: c.runOpen === true, start: Number(c.runStart) || 0,
+    checked: Number(c.cycChecked) || 0, games: Number(c.cycGames) || 0, packages: Number(c.cycPackages) || 0,
+    held: Number(c.cycHeld) || 0, names: Array.isArray(c.cycNames) ? c.cycNames.map(String).slice(0, 40) : []
+  };
+  const finishRun = async () => {
+    if (!run.open) return;
+    const ok = await costNoticeSend(env, costFinishText('Cost Update', { checked: run.checked, games: run.games, packages: run.packages, names: run.names, unreachable: cycUnreachable, held: run.held, started: run.start }));
+    if (ok) run.open = false; // not sent (Telegram hiccup): stays open and is retried on the next tick
+  };
 
   if (subrequestsLeft(env) < COST_START_MIN_BUDGET) {
     console.log('Cost tick waiting - subrequest budget low (' + subrequestsLeft(env) + ' left)');
@@ -2930,6 +2980,7 @@ async function runContinuousCostTick(env, st, todayStr) {
   // ---- End of a cycle (or first run): report problems, then rebuild the queue ----
   let builtAt = Number(c.builtAt) || 0;
   if (!queue || pos >= queue.length) {
+    if (run.open) { await finishRun(); run.open = false; } // normally already sent at the end of the last tick of the cycle
     if (queue && queue.length) {
       const skippedN = Object.keys(crashes).filter(id => (Number(crashes[id]) || 0) >= 2).length;
       if ((cycUnreachable || skippedN) && nowMs - lastWarnAt > COST_CONT_WARN_GAP_MS) {
@@ -2949,6 +3000,10 @@ async function runContinuousCostTick(env, st, todayStr) {
     };
     queue = rows.filter(g => isLinked(g.fields)).map(g => String(g.id)).sort();
     pos = 0; builtAt = nowMs; cycUnreachable = 0;
+    Object.assign(run, { checked: 0, games: 0, packages: 0, held: 0, names: [] });
+    if (costNotifyAll(env) && queue.length && await costNoticeSend(env, costStartText('Cost Update', `Checking ${queue.length} linked game(s) against the providers.`))) {
+      run.open = true; run.start = nowMs;
+    }
     const live = new Set(queue);
     Object.keys(stats).forEach(id => { if (!live.has(id)) delete stats[id]; });
     Object.keys(crashes).forEach(id => { if (!live.has(id)) delete crashes[id]; });
@@ -2957,6 +3012,7 @@ async function runContinuousCostTick(env, st, todayStr) {
   const cont = {
     queue, pos, builtAt, stats, crashes, inFlight: [], cycUnreachable, lastWarnAt,
     lastOkAt: nowMs, dayDate: todayStr,
+    runOpen: run.open, runStart: run.start, cycChecked: run.checked, cycGames: run.games, cycPackages: run.packages, cycHeld: run.held, cycNames: run.names,
     dayChecked: day.checked, dayGames: day.games, dayPackages: day.packages, dayUnreachable: day.unreachable, dayPartial: day.partial, dayHeld: day.held
   };
   const save = () => patchDoc(env, 'settings/priceUpdateSweep', { cont }, ['cont']);
@@ -2993,9 +3049,16 @@ async function runContinuousCostTick(env, st, todayStr) {
         if (cd) g.fields.packages = mergeCostsIntoPackages(g.fields.packages, cd.fields);
         g.fields.__guard = cd ? (cd.fields.guard || {}) : null; // null = no gameCosts doc yet: nowhere to keep guard state
         try {
-          const r = await costCheckGame(env, g, ctx, 'continuous');
+          const r = await costCheckGame(env, g, ctx, 'continuous', {
+            // Runs right BEFORE the first Cost change of a run is saved: the admin hears "starting" first.
+            onApplyStart: async (gameName, n) => {
+              if (run.open) return;
+              const ok = await costNoticeSend(env, costStartText('Cost Update', `Provider price change found - applying the new Cost now.\nFirst: <b>${esc(gameName)}</b> (${n} package(s))\nPrice is not touched.`));
+              if (ok) { run.open = true; run.start = Date.now(); }
+            }
+          });
           if (r.status !== 'none') {
-            day.checked++;
+            day.checked++; run.checked++;
             if (r.status === 'unreachable') { day.unreachable++; cycUnreachable++; stats[id] = { u: Number((stats[id] || {}).u) || 0, at: 0 }; }
             else {
               if (r.partial) { day.partial++; stats[id] = { u: Number((stats[id] || {}).u) || 0, at: 0 }; } // incomplete answer: no backoff
@@ -3004,9 +3067,10 @@ async function runContinuousCostTick(env, st, todayStr) {
               else { const u = (Number((stats[id] || {}).u) || 0) + 1; stats[id] = { u, at: u >= 3 ? nowMs + costBackoffMs(u, env) : 0 }; }
               if (r.status === 'changed') {
                 day.games++; day.packages += r.savedCount; stats[id] = { u: 0, at: 0 };
+                run.games++; run.packages += r.savedCount; if (run.names.length < 40) run.names.push(String(g.fields.name || id));
                 if (subrequestsLeft(env) >= 12) await priceFollowCostNow(env, id);   // Price follows the new Cost AT ONCE (games with "Auto Update Price" ON), no waiting for the price schedule
               }
-              if (r.held) day.held += r.held;
+              if (r.held) { day.held += r.held; run.held += r.held; }
             }
           }
         } catch (err) { console.error('Cost tick - game check failed', id, err); day.unreachable++; cycUnreachable++; }
@@ -3016,7 +3080,10 @@ async function runContinuousCostTick(env, st, todayStr) {
   }
   pos = (processed === todo.length) ? p : todoIdx[processed - 1] + 1;
 
-  Object.assign(cont, { pos, cycUnreachable, dayChecked: day.checked, dayGames: day.games, dayPackages: day.packages, dayUnreachable: day.unreachable, dayPartial: day.partial, dayHeld: day.held, inFlight: [], lastOkAt: Date.now() });
+  // The cycle has been through every game: tell the admin the Cost update is finished (a new message, so it notifies).
+  if (pos >= queue.length && run.open && subrequestsLeft(env) >= 4) await finishRun();
+
+  Object.assign(cont, { runOpen: run.open, runStart: run.start, cycChecked: run.checked, cycGames: run.games, cycPackages: run.packages, cycHeld: run.held, cycNames: run.names, pos, cycUnreachable, dayChecked: day.checked, dayGames: day.games, dayPackages: day.packages, dayUnreachable: day.unreachable, dayPartial: day.partial, dayHeld: day.held, inFlight: [], lastOkAt: Date.now() });
   await save();
 }
 
@@ -3090,12 +3157,14 @@ async function runAutoPriceUpdateSweep(env, opts) {
   if (freshRun) {
     // covers = the slots that were due when this run STARTED; only those are marked done when it finishes
     // (a slot that became due later still gets its own run afterwards).
-    run = { slot: key, covers: manual ? [] : Array.from(new Set([key, ...pending])), lastId: '', ticks: 0, scanDone: false, updatedGames: 0, updatedPackages: 0, checked: 0, unreachable: 0, partial: 0, crashes: {}, skipped: [], inFlight: [] };
+    run = { slot: key, covers: manual ? [] : Array.from(new Set([key, ...pending])), lastId: '', startedAt: Date.now(), ticks: 0, scanDone: false, updatedGames: 0, updatedPackages: 0, checked: 0, unreachable: 0, partial: 0, crashes: {}, skipped: [], inFlight: [] };
     attemptsNow = manual ? 0 : attempts + 1;
     // Only a FRESH run is written before it starts (so a crash while building the game list can't loop forever).
     // Continuing ticks write their progress themselves, per batch, inside applyAutoPriceUpdates.
     const base = manual ? { costRun: run } : { slotsDate: todayStr, slotsDone: doneSlots, slotAttempts: { ...attemptsMap, [key]: attemptsNow }, costRun: run };
     await patchDoc(env, 'settings/priceUpdateSweep', base, Object.keys(base));
+    // Tell the admin the run is starting (a new message, so it notifies). Non-critical: never blocks the run.
+    await costNoticeSend(env, costStartText(manual ? 'Manual Cost Update' : 'Cost Update', manual ? 'Checking every linked game against the providers now.' : `Scheduled run (${esc(String(key))} slot) - checking every linked game against the providers.`));
   }
   run.ticks = (Number(run.ticks) || 0) + 1;
   run.updatedGames = Number(run.updatedGames) || 0;
@@ -3115,13 +3184,7 @@ async function runAutoPriceUpdateSweep(env, opts) {
 
     if (manual) {
       await patchDoc(env, 'settings/priceUpdateSweep', { manualCost: false, costRun: null }, ['manualCost', 'costRun']);
-      const body = result.updatedPackages > 0
-        ? `${result.updatedPackages} package(s) in ${result.updatedGames} game(s) updated · Cost only, Price unchanged`
-        : 'No Cost changes found';
-      try {
-        await tgApi(env, 'sendMessage', { chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML',
-          text: `📋 <b>Cost Update — manual run</b>\nChecked ${result.checked} game(s) · ${body}${warn.length ? '\n' + warn.join('\n') : ''}` });
-      } catch (e) { console.error('Manual cost summary failed:', e); }
+      await costNoticeSend(env, costFinishText('Manual Cost Update', { checked: result.checked, games: result.updatedGames, packages: result.updatedPackages, unreachable: result.unreachable, partial: result.partial, skipped: result.skipped, started: Number(run.startedAt) || 0 }));
       return;
     }
 
@@ -3140,6 +3203,8 @@ async function runAutoPriceUpdateSweep(env, opts) {
       { slotsDate: todayStr, slotsDone: newDone, dayRuns, dayGames, dayPackages, dayChecked, dayUnreachable, daySkipped, dayPartial, costRun: null },
       ['slotsDate', 'slotsDone', 'dayRuns', 'dayGames', 'dayPackages', 'dayChecked', 'dayUnreachable', 'daySkipped', 'dayPartial', 'costRun']);
     covered.forEach(t => _costSlotMemo.done.add(t));
+    // This run is finished: tell the admin right away (the day summary below only comes after the LAST slot).
+    await costNoticeSend(env, costFinishText('Cost Update', { checked: result.checked, games: result.updatedGames, packages: result.detected, unreachable: result.unreachable, partial: result.partial, skipped: result.skipped, started: Number(run.startedAt) || 0 }));
 
     // One summary message once every scheduled slot for today has finished (also tells you "nothing changed").
     if (schedule.length && schedule.every(t => newDone.includes(t)) && st.summarySentDate !== todayStr) {
@@ -3769,6 +3834,10 @@ async function costCheckGame(env, g, ctx, slotLabel, opts) {
 
   // ---- Save the Cost changes (+ guard + audit row, ONE atomic commit) ----
   if (an.apply.size) {
+    // opts.onApplyStart(gameName, packageCount): lets the caller send its "Cost Update starting" notice BEFORE the save.
+    if (typeof opts.onApplyStart === 'function') {
+      try { await opts.onApplyStart(gameName, an.apply.size); } catch (e) { console.error('Cost start notice failed', g.id, e); }
+    }
     try {
       // Re-apply onto the FRESH game doc (see updateGamePackagesMerged) so a Price/Cost the admin saved while
       // this sweep was calling the providers is never overwritten.
