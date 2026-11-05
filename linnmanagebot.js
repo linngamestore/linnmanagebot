@@ -4668,11 +4668,11 @@ function richOrderBlocks(title, rows, tail) {
 // (success = green, danger = red, primary = blue) is kept; emoji are stripped from labels like cleanButtonLabels().
 const RICH_BTN_STYLES = ['success', 'danger', 'primary', 'link'];
 // Even rows: every label is padded with invisible Braille blanks (U+2800, never trimmed) so (a) all buttons in a row
-// are the same width and (b) EVERY row has the same total width KB_ROW_TARGET, a little wider than the bubble.
+// are the same width and (b) EVERY row has the same total width KB_ROW_TARGET, kept INSIDE the bubble so nothing is clipped.
 // Telegram squeezes each row to the bubble width, so Confirm | Reject, a lone button and 3-button rows all share one
-// left and right edge. Only the invisible filler overflows. Raise KB_ROW_TARGET if rows look narrower than the
+// left and right edge. Raise KB_ROW_TARGET if rows look narrower than the
 // bubble, lower it if label text starts to get clipped.
-const KB_ROW_TARGET = 44;
+const KB_ROW_TARGET = 30;   // was 44: rows wider than the bubble were squeezed/clipped and the text leaned sideways
 const KB_BLANK = '\u2800';
 function kbWidth(s) {
   let w = 0;
