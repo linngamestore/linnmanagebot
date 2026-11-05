@@ -4667,15 +4667,41 @@ function richOrderBlocks(title, rows, tail) {
 // inline_keyboard rows -> in-message button rows (one RichBlockButtons per row, max 8 each). The button colour
 // (success = green, danger = red, primary = blue) is kept; emoji are stripped from labels like cleanButtonLabels().
 const RICH_BTN_STYLES = ['success', 'danger', 'primary', 'link'];
+// Even rows: every label is padded with invisible Braille blanks (U+2800, never trimmed) so (a) all buttons in a row
+// are the same width and (b) EVERY row has the same total width KB_ROW_TARGET, a little wider than the bubble.
+// Telegram squeezes each row to the bubble width, so Confirm | Reject, a lone button and 3-button rows all share one
+// left and right edge. Only the invisible filler overflows. Raise KB_ROW_TARGET if rows look narrower than the
+// bubble, lower it if label text starts to get clipped.
+const KB_ROW_TARGET = 44;
+const KB_BLANK = '\u2800';
+function kbWidth(s) {
+  let w = 0;
+  for (const ch of String(s || '')) {
+    const cp = ch.codePointAt(0);
+    if ((cp >= 0x102b && cp <= 0x103e) || cp === 0x1036 || cp === 0x1037 || cp === 0x1038) continue;   // Burmese combining marks
+    if (cp >= 0x1f000 || (cp >= 0x2600 && cp <= 0x27bf)) { w += 2; continue; }                          // emoji
+    w += 1;
+  }
+  return w;
+}
 function kbBlocks(rows, noStyle) {
-  return (rows || []).filter(r => Array.isArray(r) && r.length).map(row => ({
-    type: 'buttons', align: 'center',
-    buttons: row.slice(0, 8).map(b => {
-      const { style, ...rest } = b || {};
-      const t = String(rest.text || '').replace(BTN_EMOJI_RE, '').replace(/\s{2,}/g, ' ').trim() || rest.text;
-      return { ...rest, text: t, ...(!noStyle && RICH_BTN_STYLES.includes(style) && !(style === 'link' && !rest.callback_data) ? { style } : {}) };
-    })
+  const clean = (rows || []).filter(r => Array.isArray(r) && r.length).map(row => row.slice(0, 8).map(b => {
+    const { style, ...rest } = b || {};
+    const t = String(rest.text || '').replace(BTN_EMOJI_RE, '').replace(/\s{2,}/g, ' ').trim() || rest.text;
+    return { ...rest, text: t, ...(!noStyle && RICH_BTN_STYLES.includes(style) && !(style === 'link' && !rest.callback_data) ? { style } : {}) };
   }));
+  return clean.map(row => {
+    const w = Math.max(...row.map(b => kbWidth(b.text)), Math.floor(KB_ROW_TARGET / row.length));
+    return {
+      type: 'buttons', align: 'center',
+      buttons: row.map(b => {
+        const gap = w - kbWidth(b.text);
+        if (gap <= 0 || typeof b.text !== 'string') return b;
+        const l = Math.floor(gap / 2);
+        return { ...b, text: KB_BLANK.repeat(l) + b.text + KB_BLANK.repeat(gap - l) };
+      })
+    };
+  });
 }
 // Swap the keyboard of an existing card. Rich cards carry the buttons INSIDE the message, so the message is
 // re-rendered; classic cards just get a new reply_markup.
