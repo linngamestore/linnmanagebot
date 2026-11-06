@@ -4145,25 +4145,43 @@ function costDigestDir(rows) {
   const up = rows.some(r => r.o > 0 && r.n > r.o), down = rows.some(r => r.o > 0 && r.n < r.o);
   return up && down ? '↕' : up ? '↑' : down ? '↓' : '•';
 }
-function costDigestListView(d, kind) {
+const COST_DIGEST_PAGE = 10;        // games shown per page (5 rows x 2); "Next" shows the following 10
+const DIGEST_BTN_W = 18;            // every game button is padded to this width, so all left / right edges line up
+const DIGEST_NAME_MAX = 14;         // a longer game name is cut and ends with "..."
+function digestBtnText(name, dir) {
+  let n = String(name || '').replace(/\s+/g, ' ').trim();
+  const chars = [...n];
+  if (chars.length > DIGEST_NAME_MAX) n = chars.slice(0, DIGEST_NAME_MAX - 3).join('').trimEnd() + '...';
+  const t = `${n} ${dir}`, gap = Math.max(0, DIGEST_BTN_W - kbWidth(t)), l = Math.floor(gap / 2);
+  return KB_BLANK.repeat(l) + t + KB_BLANK.repeat(gap - l);
+}
+function costDigestListView(d, kind, page) {
   const K = DIGEST_KINDS[kind || 'cost'];
-  const ids = Object.keys(d.items).sort((a, b) => (d.items[b].at || 0) - (d.items[a].at || 0)).slice(0, COST_DIGEST_MAX_GAMES);
-  const pk = ids.reduce((n, id) => n + (d.items[id].rows || []).length, 0);
-  const last = new Date((Math.max(0, ...ids.map(id => d.items[id].at || 0))) + YANGON_OFFSET_MINUTES * 60000);
+  const all = Object.keys(d.items).sort((a, b) => (d.items[b].at || 0) - (d.items[a].at || 0)).slice(0, COST_DIGEST_MAX_GAMES);
+  const pages = Math.max(1, Math.ceil(all.length / COST_DIGEST_PAGE));
+  page = Math.min(Math.max(0, Number(page) || 0), pages - 1);
+  const ids = all.slice(page * COST_DIGEST_PAGE, (page + 1) * COST_DIGEST_PAGE);
+  const pk = all.reduce((n, id) => n + (d.items[id].rows || []).length, 0);
+  const last = new Date((Math.max(0, ...all.map(id => d.items[id].at || 0))) + YANGON_OFFSET_MINUTES * 60000);
   const hhmm = `${String(last.getUTCHours()).padStart(2, '0')}:${String(last.getUTCMinutes()).padStart(2, '0')}`;
   const title = `${K.word} Update · ${d.date}`;
-  const sub = `${ids.length} game(s) · ${pk} package(s) · last ${hhmm}\nTap a game to see its table.`;
+  const sub = `${all.length} game(s) · ${pk} package(s) · last ${hhmm}\nTap a game to see its table.` + (pages > 1 ? `\nPage ${page + 1}/${pages}` : '');
   const rows = [];
   for (let i = 0; i < ids.length; i += 2) {
-    rows.push(ids.slice(i, i + 2).map(id => ({ text: `${String(d.items[id].name || id).slice(0, 22)} ${costDigestDir(d.items[id].rows || [])}`, callback_data: `${K.g}:${id}` })));
+    rows.push(ids.slice(i, i + 2).map(id => ({ text: digestBtnText(d.items[id].name || id, costDigestDir(d.items[id].rows || [])), callback_data: `${K.g}:${id}:${page}` })));
   }
+  if (pages > 1) rows.push([
+    { text: page > 0 ? '‹ Prev' : '·', callback_data: `${K.l}:${page > 0 ? page - 1 : page}` },
+    { text: `${page + 1}/${pages}`, callback_data: `${K.l}:${page}` },
+    { text: page < pages - 1 ? 'Next ›' : '·', callback_data: `${K.l}:${page < pages - 1 ? page + 1 : page}` }
+  ]);
   return {
     blocks: [{ type: 'paragraph', text: { type: 'bold', text: title } }, ...sub.split('\n').map(l => ({ type: 'paragraph', text: l }))],
     html: `<b>${esc(title)}</b>\n${esc(sub)}`,
     rows
   };
 }
-function costDigestGameView(d, gameId, kind) {
+function costDigestGameView(d, gameId, kind, page) {
   const K = DIGEST_KINDS[kind || 'cost'];
   const it = d.items[gameId];
   if (!it) return null;
@@ -4178,7 +4196,7 @@ function costDigestGameView(d, gameId, kind) {
   return {
     blocks: [{ type: 'paragraph', text: { type: 'bold', text: head } }, { type: 'table', cells, is_bordered: true, is_compact: true }, rbDivider(), { type: 'paragraph', text: K.note }],
     html: `<b>${esc(head)}</b>\n` + list.map(r => `${esc(r[0])}: ${esc(r[1])} → ${esc(r[2])} (${esc(r[3])})`).join('\n') + '\n' + K.note,
-    rows: [[{ text: '⬅️ Back to list', callback_data: `${K.l}:x` }]]
+    rows: [[{ text: '⬅️ Back to list', callback_data: `${K.l}:${Number(page) || 0}` }]]
   };
 }
 // Sends (messageId = 0) or edits the digest message. Rich message first, classic HTML if Telegram refuses it.
@@ -4224,7 +4242,10 @@ async function costDigestAdd(env, gameId, gameName, saved, kind) {
 async function handleCostDigestCallback(env, action, targetId, cb) {
   const kind = action[0] === 'p' ? 'price' : 'cost';
   const d = costDigestParse(await getDoc(env, DIGEST_KINDS[kind].path), yangonDateStr(yangonNow()));
-  const view = action.endsWith('g') ? costDigestGameView(d, targetId, kind) : costDigestListView(d, kind);
+  const isGame = action.endsWith('g'), cut = String(targetId).lastIndexOf(':');
+  const gid = isGame && cut > 0 ? String(targetId).slice(0, cut) : targetId;          // cdg:<gameId>:<page>  (an old button without a page still works)
+  const pg = isGame ? (cut > 0 ? Number(String(targetId).slice(cut + 1)) || 0 : 0) : Number(targetId) || 0;
+  const view = isGame ? costDigestGameView(d, gid, kind, pg) : costDigestListView(d, kind, pg);
   if (!view || (action.endsWith('l') && !Object.keys(d.items).length)) { await answerCallback(env, cb.id, 'This list is from an earlier day.'); return; }
   const m = cb.message;
   let res = await costDigestPut(env, m.chat.id, m.message_id, view);
