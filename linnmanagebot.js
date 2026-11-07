@@ -84,43 +84,19 @@ const FIRESTORE_SCOPE = 'https://www.googleapis.com/auth/datastore https://www.g
 // previous account and answered 404 / Cloudflare error 1042.
 const JCPLAYS_PROXY_URL = 'https://jcplays-provider.linngamestore.workers.dev/jcplays-proxy';
 // Cloudflare blocks a plain fetch() from one Worker to another's workers.dev URL on the
-// same account (error 1042, same story as AUTH_WORKER below). Optional fix: Worker ->
+// same account (Cloudflare error 1042). Optional fix: Worker ->
 // Settings -> Bindings -> Add -> Service binding, variable name JCPLAYS_PROVIDER,
 // service = jcplays-provider. Falls back to a plain fetch() until the binding exists.
 function callJCPlaysProxy(env, jcplays, init) {
   const url = (jcplays && typeof jcplays.proxyUrl === 'string' && jcplays.proxyUrl.trim()) || JCPLAYS_PROXY_URL;
+  if (env.JCPLAYS_PROXY_SECRET) init = { ...init, headers: { ...(init && init.headers), 'X-Proxy-Secret': env.JCPLAYS_PROXY_SECRET } };
   if (env.JCPLAYS_PROVIDER && typeof env.JCPLAYS_PROVIDER.fetch === 'function') {
     _subrequestsUsed++; // service-binding calls aren't seen by the patched global fetch
     return env.JCPLAYS_PROVIDER.fetch(url, init);
   }
   return fetch(url, init); // patched global fetch counts this one itself
 }
-const FAZERCARD_BASE_URL = 'https://api.fzr.cards/api/v2';
-// The customer-facing bot (linngamestorebot / @linngamestorebot), a separate
-// Worker (gamestore-auth-worker.js) — this file only ever talks to it via
-// its /notify-topup-status endpoint, to DM a customer back in *that* bot's
-// chat after a human resolves their wallet top-up here. See
-// notifyTopupCustomer() below.
-const AUTH_WORKER_URL = 'https://linngamestore.linngamestore.workers.dev';
-// Both Workers live on the same account's workers.dev subdomain, and Cloudflare
-// blocks a plain fetch() from one to the other's public URL (error 1042 - it
-// answers 404/HTML instead of running the target Worker). That is why the
-// customer DMs never arrived even though calling the URL from outside (curl)
-// worked fine. The fix is a Service Binding: Cloudflare dashboard ->
-// this Worker -> Settings -> Bindings -> Add -> Service binding, variable name
-// AUTH_WORKER, service = the gamestore-auth-worker Worker (linngamestore).
-// Falls back to a plain fetch() when the binding isn't set up yet, so nothing
-// breaks before the binding exists.
-function callAuthWorker(env, path, init) {
-  const url = `${AUTH_WORKER_URL}${path}`;
-  if (env.AUTH_WORKER && typeof env.AUTH_WORKER.fetch === 'function') {
-    _subrequestsUsed++; // service-binding calls aren't seen by the patched global fetch
-    return env.AUTH_WORKER.fetch(url, init);
-  }
-  return fetch(url, init); // patched global fetch counts this one itself
-}
 const MAX_WALLET_FULFILL_ATTEMPTS = 5; // after this many failures, give up and mark the order Fail
-// JCPlays / FazerCards have no quantity parameter: the Worker places a multi-quantity order as one provider call PER UNIT.
 // Keep it small (each unit costs several subrequests). The store's stepper uses the same cap (GAME_QTY_CAP).
 const UNIT_LOOP_QTY_CAP = 5;
 // KEEP the total (30s+2m+5m+10m ~ 17.5 min) under G2Bulk's 30-minute idempotency window: a retry after an ambiguous error
@@ -210,7 +186,7 @@ function maintenanceTexts(kind, minutes, reason) {
   return { title, intro, details, bot: `${title}\n\n${details}` };
 }
 
-// Sends the notice to (a) all store users and (b) all customer-bot users.
+// Sends the notice to all store users (in-app notification).
 async function announceMaintenance(env, kind, minutes, reason) {
   const t = maintenanceTexts(kind, minutes, reason);
   const out = { store: false, botRecipients: null };
@@ -218,19 +194,6 @@ async function announceMaintenance(env, kind, minutes, reason) {
     const r = await createDoc(env, 'notifications', { title: t.title, intro: t.intro, details: t.details, timestamp: new Date() });
     out.store = !!(r && !r.error);
   } catch (e) { console.error('announceMaintenance: store notification failed', e); }
-  try {
-    const sd = await getDoc(env, 'settings/adminBroadcast');
-    const secret = sd && sd.fields && sd.fields.secret;
-    if (secret) {
-      const res = await callAuthWorker(env, '/admin/broadcast', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ secret, text: t.bot })
-      });
-      const j = await res.json().catch(() => ({}));
-      if (j && j.ok) out.botRecipients = j.recipients;
-    }
-  } catch (e) { console.error('announceMaintenance: bot broadcast failed', e); }
   return out;
 }
 
@@ -1248,12 +1211,17 @@ async function handleAdminUsers(request, env) {
   return J({ ok: false, error: 'Unknown operation' }, 400);
 }
 
+// JCPlays endpoints the admin panel may call through /admin-proxy/jcplays.
+const ADMIN_PROXY_JCPLAYS_ENDPOINTS = new Set(['querypoints', 'product', 'productlist', 'createorder']);
 const ADMIN_SETTINGS_MASK = '********';
 const ADMIN_SETTINGS_SPEC = {
   g2bulk:      { path: 'settings/g2bulk',      secrets: ['apiKey', 'webhookSecret'],
                  plain: { usdRate: 'num', webhookUrl: 'url', lowBalanceAlert: 'num', enabled: 'bool', pauseAutoFulfill: 'bool', etaPause: 'bool' } },
   telegramBot: { path: 'settings/telegramBot', secrets: ['botToken', 'webhookSecret'],
-                 plain: { chatId: 'str', webhookUrl: 'url', botUsername: 'str', enabled: 'bool' } }
+                 plain: { chatId: 'str', webhookUrl: 'url', botUsername: 'str', enabled: 'bool' } },
+  // JCPlays M_KEY lives only here (Firestore) - the browser sees '********' and calls /admin-proxy/jcplays.
+  jcplays:     { path: 'settings/jcplays',     secrets: ['mKey'],
+                 plain: { baseUrl: 'url', proxyUrl: 'url', uid: 'str', email: 'str', usdRate: 'num', lowBalanceAlert: 'num', enabled: 'bool' } }
 };
 function adminSettingsView(spec, fields) {
   const out = {};
@@ -1371,6 +1339,30 @@ async function handleAdminProxy(request, env, url) {
     if (!token) return J({ ok: false, error: 'Telegram bot not configured' }, 400);
     const h = {}; passHdr(h, ['Content-Type']);
     upstream = await fetch(`https://api.telegram.org/bot${token}/${method}`, { method: request.method, headers: h, body });
+  } else if (provider === 'jcplays') {
+    // The admin panel never holds the M_KEY: this reads it from settings/jcplays, then relays the signed
+    // call through the jcplays-provider Worker (same path the order fulfilment uses).
+    if (request.method !== 'POST') return J({ ok: false, error: 'Method not allowed' }, 405);
+    let jb; try { jb = JSON.parse(new TextDecoder().decode(body || new ArrayBuffer(0))); } catch (e) { return J({ ok: false, error: 'Bad JSON' }, 400); }
+    const endpointPath = String((jb && jb.endpointPath) || '');
+    if (!ADMIN_PROXY_JCPLAYS_ENDPOINTS.has(endpointPath)) return J({ ok: false, error: 'Endpoint not allowed' }, 403);
+    const extraParams = (jb && jb.extraParams && typeof jb.extraParams === 'object' && !Array.isArray(jb.extraParams)) ? jb.extraParams : {};
+    const sd = await getDoc(env, 'settings/jcplays');
+    const f = (sd && sd.fields) || {};
+    // "Verify" may test credentials typed in the form before saving. A masked / empty value means "use the saved one".
+    const cand = (jb && jb.candidate && typeof jb.candidate === 'object') ? jb.candidate : null;
+    const pick = (k) => { const v = cand && cand[k] != null ? String(cand[k]).trim() : ''; return (v && !/^\*+$/.test(v)) ? v : String(f[k] || '').trim(); };
+    const uid = pick('uid'), email = pick('email'), mKey = pick('mKey');
+    const baseUrl = pick('baseUrl') || 'https://jcplays.com/smilecoin/api';
+    if (!uid || !email || !mKey) return J({ ok: false, error: 'JCPlays credentials are not configured' }, 400);
+    // The M_KEY is only ever sent to jcplays.com - never to a host an admin typed into the form.
+    let bu; try { bu = new URL(baseUrl); } catch (e) { bu = null; }
+    if (!bu || bu.protocol !== 'https:' || !(bu.hostname === 'jcplays.com' || bu.hostname.endsWith('.jcplays.com'))) return J({ ok: false, error: 'JCPlays Base URL must be an https://jcplays.com address' }, 400);
+    upstream = await callJCPlaysProxy(env, f, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpointPath, extraParams, uid, email, mKey, baseUrl })
+    });
   } else {
     return J({ ok: false, error: 'Unknown provider' }, 404);
   }
@@ -1400,28 +1392,47 @@ function base64url(input) {
 }
 
 async function importPrivateKey(pem) {
-  const cleaned = pem.replace(/\\n/g, '\n');
-  const body = cleaned
-    .replace('-----BEGIN PRIVATE KEY-----', '')
-    .replace('-----END PRIVATE KEY-----', '')
-    .replace(/\s+/g, '');
+  let raw = String(pem == null ? '' : pem).trim();
+  if (!raw) throw new Error('FIREBASE_PRIVATE_KEY secret is empty');
+  // The whole service-account JSON was pasted instead of just the private_key value.
+  if (raw[0] === '{') { try { raw = String(JSON.parse(raw).private_key || raw); } catch (e) { /* fall through */ } }
+  // Pasted with surrounding quotes, literal "\n" sequences or Windows line breaks: all common, all made atob() throw
+  // "InvalidCharacterError" and killed every cron tick with "Firestore auth failed".
+  raw = raw.replace(/^["']+|["']+$/g, '').replace(/\\r/g, '').replace(/\\n/g, '\n');
+  if (/BEGIN RSA PRIVATE KEY/.test(raw)) throw new Error('FIREBASE_PRIVATE_KEY must be the PKCS8 key ("BEGIN PRIVATE KEY") from the service-account JSON');
+  const body = raw
+    .replace(/-----BEGIN [A-Z ]+-----/g, '')
+    .replace(/-----END [A-Z ]+-----/g, '')
+    .replace(/[^A-Za-z0-9+/=]/g, '');
+  if (body.length < 500) throw new Error('FIREBASE_PRIVATE_KEY looks truncated (' + body.length + ' base64 chars)');
   const der = Uint8Array.from(atob(body), c => c.charCodeAt(0));
   return crypto.subtle.importKey(
     'pkcs8', der.buffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']
   );
 }
 
+// One token request at a time: a burst of parallel Firestore calls used to each sign a JWT and each hit
+// oauth2.googleapis.com (wasting the 50-subrequest budget on the free plan).
+let tokenInflight = null;
 async function getAccessToken(env) {
   const now = Math.floor(Date.now() / 1000);
   if (cachedToken && cachedToken.expires > now + 60) return cachedToken.token;
+  if (!tokenInflight) tokenInflight = fetchAccessToken(env).finally(() => { tokenInflight = null; });
+  return tokenInflight;
+}
 
+async function fetchAccessToken(env) {
+  const now = Math.floor(Date.now() / 1000);
+  if (!env.FIREBASE_CLIENT_EMAIL || !env.FIREBASE_PRIVATE_KEY) {
+    throw new Error('Firestore auth failed: FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY secret is not set on this Worker');
+  }
   const header = { alg: 'RS256', typ: 'JWT' };
   const claim = {
-    iss: env.FIREBASE_CLIENT_EMAIL,
+    iss: String(env.FIREBASE_CLIENT_EMAIL).trim(),
     scope: FIRESTORE_SCOPE,
     aud: 'https://oauth2.googleapis.com/token',
-    iat: now,
-    exp: now + 3600
+    iat: now - 10,            // small back-dating: a clock a few seconds fast made Google reject the token as "issued in the future"
+    exp: now - 10 + 3500
   };
   const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claim))}`;
   const key = await importPrivateKey(env.FIREBASE_PRIVATE_KEY);
@@ -1435,8 +1446,8 @@ async function getAccessToken(env) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
   });
-  const data = await res.json();
-  if (!data.access_token) throw new Error('Firestore auth failed: ' + JSON.stringify(data));
+  const data = await res.json().catch(() => ({}));
+  if (!data.access_token) throw new Error('Firestore auth failed (HTTP ' + res.status + '): ' + JSON.stringify(data));
   cachedToken = { token: data.access_token, expires: now + (data.expires_in || 3600) };
   return cachedToken.token;
 }
@@ -1641,7 +1652,7 @@ async function sendFcmPush(env, fcmToken, title, body, data = {}, image = '') {
 
 function userEmailOf(f) {
   if (!f) return '';
-  const e = String(f.googleEmail || f.facebookEmail || f.linkedEmail || '').trim();
+  const e = String(f.googleEmail || f.facebookEmail || f.linkedEmail || f.email || '').trim();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) ? e : '';
 }
 
@@ -1665,9 +1676,10 @@ async function sendEmail(env, to, subject, html, attachments) {
   return res.ok;
 }
 
+const EMAIL_LOGO_URL = 'https://linngamestore.com/apple-touch-icon.png';   // same logo as the OTP mail; must be a public https image
 function emailShell(title, bodyHtml) {
   return `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden">
-  <div style="background:linear-gradient(90deg,#2563eb,#7c3aed);color:#fff;padding:16px 20px;font-size:18px;font-weight:bold">LINN GAME STORE</div>
+  <div style="background:#7c3aed;background:linear-gradient(90deg,#2563eb,#7c3aed);color:#fff;padding:16px 20px;font-size:18px;font-weight:bold;text-align:center"><img src="${EMAIL_LOGO_URL}" alt="LINN GAME STORE" width="56" height="56" style="width:56px;height:56px;border-radius:14px;display:block;margin:0 auto 8px;object-fit:cover;border:2px solid #ffffff">LINN GAME STORE</div>
   <div style="padding:20px"><h2 style="margin:0 0 12px;font-size:18px">${title}</h2>${bodyHtml}</div>
   <div style="padding:12px 20px;font-size:12px;color:#9ca3af;background:#f9fafb">This is an automated message from LINN GAME STORE.</div></div>`;
 }
@@ -2727,7 +2739,6 @@ async function updateGamePackagesMerged(env, gameId, mutate, opts) {
 
 // ---- Provider list memo --------------------------------------------------------------------------------
 // Several games often share ONE provider list (same G2Bulk game code, same JCPlays product, same voucher /
-// FazerCards category). The old per-tick Maps were thrown away after every cron tick, so the next tick fetched
 // the very same list again. This memo lives for the isolate's lifetime: a good answer is reused for 5 minutes
 // (a Cost can therefore be at most 5 min "late"), a failed answer only for 30 s so a provider outage is
 // retried quickly but never hammered twice inside one tick.
@@ -2964,7 +2975,7 @@ async function runContinuousCostTick(env, st, todayStr) {
     } catch (e) { console.error('Cost daily summary failed:', e); }
   }
 
-  await prefetchSettingsMemo(env, ['settings/g2bulk', 'settings/jcplays', 'settings/fazercard']);
+  await prefetchSettingsMemo(env, ['settings/g2bulk', 'settings/jcplays']);
   const g2bulkDoc = await getSettingsMemo(env, 'settings/g2bulk');
   const g2bulk = (g2bulkDoc && g2bulkDoc.fields) || {};
   const g2bulkOff = g2bulk.enabled === false;
@@ -2972,10 +2983,7 @@ async function runContinuousCostTick(env, st, todayStr) {
     g2bulkOff,
     rate: Number(g2bulk.usdRate) || 4500,
     jcplays: ((await getSettingsMemo(env, 'settings/jcplays')) || {}).fields || {},
-    fazercard: ((await getSettingsMemo(env, 'settings/fazercard')) || {}).fields || {},
-    fazerRate: 4500
   };
-  ctx.fazerRate = Number(ctx.fazercard.usdRate) || 4500;
 
   // ---- End of a cycle (or first run): report problems, then rebuild the queue ----
   let builtAt = Number(c.builtAt) || 0;
@@ -2996,7 +3004,7 @@ async function runContinuousCostTick(env, st, todayStr) {
     const rows = await queryAllDocsSelect(env, 'games', COST_LINK_FIELDS);
     const isLinked = (f) => {
       const vl = !g2bulkOff && f.fulfillProvider === 'g2bulk_voucher' && f.g2bulkVoucherCategory;
-      return !!((f.g2bulkCode && !g2bulkOff) || f.jcplaysProduct || vl || f.fazercardCategoryId);
+      return !!((f.g2bulkCode && !g2bulkOff) || f.jcplaysProduct || vl);
     };
     queue = rows.filter(g => isLinked(g.fields)).map(g => String(g.id)).sort();
     pos = 0; builtAt = nowMs; cycUnreachable = 0;
@@ -3491,14 +3499,13 @@ async function loadGameWithCosts(env, id) {
 //   2. Every later tick takes the next few queued games (COST_GAMES_PER_TICK_DEFAULT, or the plain Worker variable
 //      COST_GAMES_PER_TICK), loads them (+ their gameCosts) with ONE batchGet call, and for each game asks a provider
 //      ONLY for the lists it really uses: a package that has no provider key (g2bulk / jcplays / voucherId /
-//      fazercardOfferId) is never looked up, and a game with no such package is skipped without any provider call.
 //   3. Costs are saved per game (race-safe, Cost only - Price is never touched) and that game's report goes to
 //      Telegram. Progress is saved once per tick. If a tick DIES mid-way (CPU limit), the next tick sees
 //      run.inFlight, retries those games one at a time, and a game that kills the tick twice is skipped and reported.
 //   4. The last tick sends the summary. Games a provider could not answer for are counted and reported, so
 //      "No Cost changes found" can never hide a provider outage.
 // run = settings/priceUpdateSweep.costRun, carried between ticks. Returns { finished:false } while games are left.
-const COST_LINK_FIELDS = ['fulfillProvider', 'g2bulkCode', 'jcplaysProduct', 'g2bulkVoucherCategory', 'fazercardCategoryId'];
+const COST_LINK_FIELDS = ['fulfillProvider', 'g2bulkCode', 'jcplaysProduct', 'g2bulkVoucherCategory'];
 const COST_GAME_FIELDS = ['name', 'packages', 'costs', 'guard', ...COST_LINK_FIELDS];
 
 const costKeyOf = (p, f) => (p && typeof p === 'object' && p[f] != null) ? String(p[f]).trim() : '';
@@ -3509,7 +3516,6 @@ const costPositive = (entries) => new Map(entries.filter(([, v]) => v > 0)); // 
 //
 // Rules (all automatic, no admin.html change needed):
 //  1. ONE authoritative source per package. A package that carries several provider keys is priced by the
-//     FIRST one in COST_SOURCE_ORDER (g2bulk > jcplays > voucherId > fazercardOfferId) - the very same order
 //     the order dispatcher uses to pick the provider that really fulfils it. Before, two keys on one package
 //     made the Cost flip between two prices on every check (a write + a Telegram message each time).
 //  2. Big-jump HOLD. A change of COST_GUARD_PCT % or more (default 35, Worker variable COST_GUARD_PCT, 0 = off)
@@ -3527,8 +3533,8 @@ const costPositive = (entries) => new Map(entries.filter(([, v]) => v > 0)); // 
 //  Guard state lives in gameCosts/{id}.guard = { hold:{}, miss:{}, loss:{} } keyed by a hash of provider+key.
 //  A game with no gameCosts doc yet (not migrated) has nowhere to keep it: it simply skips rules 2-4.
 // ===========================================================================================================
-const COST_SOURCE_ORDER = ['g2bulk', 'jcplays', 'voucherId', 'fazercardOfferId'];
-const COST_PROVIDER_LABEL = { g2bulk: 'G2Bulk', jcplays: 'JCPlays', voucherId: 'G2Bulk Voucher', fazercardOfferId: 'FazerCards' };
+const COST_SOURCE_ORDER = ['g2bulk', 'jcplays', 'voucherId'];
+const COST_PROVIDER_LABEL = { g2bulk: 'G2Bulk', jcplays: 'JCPlays', voucherId: 'G2Bulk Voucher' };
 const COST_GUARD_PCT_DEFAULT = 35;
 const COST_HOLD_CONFIRM_MIN_DEFAULT = 10;
 const COST_LOG_KEEP_DAYS = 90;
@@ -3688,7 +3694,6 @@ function costLogWrite(env, gameId, gameName, ctx, mode, ups) {
         gameName: encodeValue(String(gameName)),
         mode: encodeValue(String(mode || '')),
         rate: encodeValue(Number(ctx && ctx.rate) || 0),
-        fazerRate: encodeValue(Number(ctx && ctx.fazerRate) || 0),
         changes: encodeValue(ups.map(u => ({
           package: String(u.packageLabel || ''), provider: String(u.provider || ''), key: String(u.key || ''),
           from: Number(u.oldCost) || 0, to: Number(u.newCost) || 0, price: Number(u.price) || 0, afterHold: !!u.confirmed
@@ -3730,7 +3735,7 @@ async function tgSendReliable(env, payload) {
 // game has no gameCosts doc (then the hold / unverifiable / below-cost watch is skipped for it).
 async function costCheckGame(env, g, ctx, slotLabel, opts) {
   opts = opts || {};
-  const { g2bulkOff, rate, jcplays, fazercard, fazerRate } = ctx;
+  const { g2bulkOff, rate, jcplays } = ctx;
   const keyOf = costKeyOf;
   const pkgs = Array.isArray(g.fields.packages) ? g.fields.packages : [];
   const uses = (f) => pkgs.some(p => keyOf(p, f));
@@ -3795,22 +3800,6 @@ async function costCheckGame(env, g, ctx, slotLabel, opts) {
         addSource('voucherId', products.map(p => [p.id, Math.round(p.unit_price * rate)]));
       }
     } catch (err) { console.error('Cost sweep — Voucher fetch error', g.id, err); }
-  }
-
-  if (g.fields.fazercardCategoryId && uses('fazercardOfferId') && fazercard.apiKey && fazercard.enabled !== false) {
-    wanted++; attempted.add('fazercardOfferId');
-    try {
-      const cat = g.fields.fazercardCategoryId;
-      const mk = 'fazer:' + cat;
-      let offers = memoGet(mk);
-      if (offers === undefined) {
-        const res = await fetch(`${FAZERCARD_BASE_URL}/topups/offers?category_id=${encodeURIComponent(cat)}`, { headers: { 'X-API-Key': fazercard.apiKey } });
-        const data = await res.json();
-        offers = (data && data.ok && Array.isArray(data.offers)) ? data.offers : null;
-        providerMemoSet(mk, offers);
-      }
-      if (offers) addSource('fazercardOfferId', offers.map(o => [o.offer_id, Math.round(Number(o.price_usd) * fazerRate)]));
-    } catch (err) { console.error('Cost sweep — FazerCards fetch error', g.id, err); }
   }
 
   if (!wanted) return { status: 'none' };           // no package of this game uses a provider: nothing to check
@@ -3893,15 +3882,12 @@ async function costCheckGame(env, g, ctx, slotLabel, opts) {
 
 // Provider settings -> the ctx costCheckGame() needs (used by the "Apply now" button).
 async function buildCostCtx(env) {
-  await prefetchSettingsMemo(env, ['settings/g2bulk', 'settings/jcplays', 'settings/fazercard']);
+  await prefetchSettingsMemo(env, ['settings/g2bulk', 'settings/jcplays']);
   const g2bulk = ((await getSettingsMemo(env, 'settings/g2bulk')) || {}).fields || {};
-  const fazercard = ((await getSettingsMemo(env, 'settings/fazercard')) || {}).fields || {};
   return {
     g2bulkOff: g2bulk.enabled === false,
     rate: Number(g2bulk.usdRate) || 4500,
     jcplays: ((await getSettingsMemo(env, 'settings/jcplays')) || {}).fields || {},
-    fazercard,
-    fazerRate: Number(fazercard.usdRate) || 4500
   };
 }
 
@@ -3983,7 +3969,7 @@ async function handleCostCommand(env, msg) {
 async function applyAutoPriceUpdates(env, run, slotLabel) {
   if (!run.scanDone) {
     // One call instead of three for the provider settings (rates / keys); skipped while memoised.
-    await prefetchSettingsMemo(env, ['settings/g2bulk', 'settings/jcplays', 'settings/fazercard']);
+    await prefetchSettingsMemo(env, ['settings/g2bulk', 'settings/jcplays']);
     const g2bulkDoc = await getSettingsMemo(env, 'settings/g2bulk');
     const g2bulk = (g2bulkDoc && g2bulkDoc.fields) || {};
     const g2bulkOff = g2bulk.enabled === false; // only G2Bulk games/vouchers are skipped - other providers still update
@@ -3992,14 +3978,11 @@ async function applyAutoPriceUpdates(env, run, slotLabel) {
     const jcplaysDoc = await getSettingsMemo(env, 'settings/jcplays');
     const jcplays = (jcplaysDoc && jcplaysDoc.fields) || {};
 
-    const fazercardDoc = await getSettingsMemo(env, 'settings/fazercard');
-    const fazercard = (fazercardDoc && fazercardDoc.fields) || {};
-    const fazerRate = Number(fazercard.usdRate) || 4500; // FazerCards has its own USD->MMK rate in its Settings
 
     // A game is worth queueing only if it is linked to a provider at all.
     const isLinked = (f) => {
       const vl = !g2bulkOff && f.fulfillProvider === 'g2bulk_voucher' && f.g2bulkVoucherCategory;
-      return !!((f.g2bulkCode && !g2bulkOff) || f.jcplaysProduct || vl || f.fazercardCategoryId);
+      return !!((f.g2bulkCode && !g2bulkOff) || f.jcplaysProduct || vl);
     };
 
     // ---- Stage 1: build the queue (light query, no packages) ----
@@ -4021,9 +4004,6 @@ async function applyAutoPriceUpdates(env, run, slotLabel) {
     const rate = Number(g2bulk.usdRate) || 4500;
     const jcplaysDoc = await getSettingsMemo(env, 'settings/jcplays');
     const jcplays = (jcplaysDoc && jcplaysDoc.fields) || {};
-    const fazercardDoc = await getSettingsMemo(env, 'settings/fazercard');
-    const fazercard = (fazercardDoc && fazercardDoc.fields) || {};
-    const fazerRate = Number(fazercard.usdRate) || 4500;
 
     run.crashes = (run.crashes && typeof run.crashes === 'object') ? run.crashes : {};
     run.skipped = Array.isArray(run.skipped) ? run.skipped : [];
@@ -4050,7 +4030,7 @@ async function applyAutoPriceUpdates(env, run, slotLabel) {
       run.inFlight = todo.slice();
       await patchDoc(env, 'settings/priceUpdateSweep', { costRun: run }, ['costRun']); // if this tick dies, the next one knows which games to blame
 
-      const ctx = { g2bulkOff, rate, jcplays, fazercard, fazerRate };
+      const ctx = { g2bulkOff, rate, jcplays };
 
       let processed = 0;
       for (const id of todo) {
@@ -4989,9 +4969,9 @@ async function sendWalletOrderNotice(env, d, customerNameCache) {
   }
 }
 
-// Card-less / receipt-less guard. Crypto (FazerCards) top-ups verify themselves and never carry a slip.
+// Card-less / receipt-less guard: a top-up without a receipt image cannot be confirmed.
 function topupNeedsReceipt(f) {
-  return !f.fazercardPaymentId && !String(f.receiptUrl || '').trim();
+  return !String(f.receiptUrl || '').trim();
 }
 const NO_RECEIPT_MSG = 'Receipt ပုံ မပါလို့ Confirm လုပ်၍ မရပါ။ Customer ဆီက ပုံတောင်းပါ (သို့) Reject လုပ်ပါ။';
 
@@ -5123,7 +5103,6 @@ async function runCronSweepSteps(env, minute) {
     await sweepNotificationBroadcasts(env); // so the "closed" / "reopened" push still goes out
     await pollPendingVoucherOrders(env);
     await pollPendingG2BulkGameOrders(env);
-    await pollPendingFazerCardOrders(env);
     // Reports/backup are internal (nothing customer-facing) - keep them on schedule.
     await checkDailySummarySchedule(env);
     await checkWeeklySummarySchedule(env);
@@ -5145,7 +5124,6 @@ try { await reconcileWalletHolds(env); } catch (e) { console.error('reconcileWal
   const jobs = [
     async () => { await pollPendingVoucherOrders(env); },
     async () => { await pollPendingG2BulkGameOrders(env); },
-    async () => { await pollPendingFazerCardOrders(env); },
     async () => { await pollPendingG2BulkGameOrders(env); },   // 2nd slot: G2Bulk fallback poll now runs about every 10 min
     async () => { await sweepSupportTickets(env); await sweepNotificationBroadcasts(env); },
     async () => { await sweepUnnotifiedOrderPushes(env); await sweepStuckProcessingOrders(env); },
@@ -5159,8 +5137,8 @@ try { await reconcileWalletHolds(env); } catch (e) { console.error('reconcileWal
   try { await jobs[slot](); } catch (e) { console.error('cron slow job failed', slot, e); }
   // The G2Bulk status poll no longer waits for its turn in the rotation (it came round only every 10-20 min):
   // it runs on EVERY even tick, so a top-up whose webhook never arrived is still Completed within ~2 minutes.
-  // (slots 1 and 3 already ran it above)
-  if (slot !== 1 && slot !== 3) { try { await pollPendingG2BulkGameOrders(env); } catch (e) { console.error('g2bulk fast poll failed', e); } }
+  // (slots 1 and 2 already ran it above)
+  if (slot !== 1 && slot !== 2) { try { await pollPendingG2BulkGameOrders(env); } catch (e) { console.error('g2bulk fast poll failed', e); } }
 }
 
 // ---------------------------------------------------------------------------
@@ -5873,7 +5851,7 @@ async function handlePing(request, env, ctx) {
   const f = doc.fields;
   const needsWork = type === 'order'
     ? (f.paidFromWallet === true || !f.telegramMessageId)
-    : (!f.telegramMessageId && !f.fazercardPaymentId);
+    : !f.telegramMessageId;
   if (!needsWork) return corsJson({ ok: true, skipped: 'already handled' });
 
   // Fast path: send THIS doc's card right now (no cron lock, no whole-collection query). Wallet-paid orders still go
@@ -6422,16 +6400,11 @@ async function processPendingCard(env, collectionId, d, buildMessage, shared, op
       return;
     }
 
-    // Crypto top-ups (created by the fazercards-functions Worker's
-    // /fazercard-payment-create route) also skip Telegram entirely - they
-    // are only ever supposed to move to "Completed" once FazerCards' own
-    // payment status confirms it (see that Worker's /fazercard-payment-status
     // route), never via a human tapping Confirm. If this were sent to
     // Telegram, an admin could accidentally credit an invoice nobody has
     // actually paid yet. resolveTopupConfirm() below also refuses these as a
     // second layer of defense, in case a doc from before this fix still has
     // a stale telegramMessageId-less state.
-    if (collectionId === 'walletTopups' && d.fields.fazercardPaymentId) return;
 
     // Atomic "I'm sending this card" claim (fresh read + updateTime precondition) so two
     // overlapping sweeps can never both send a Telegram card for the same doc. A claim older
@@ -6993,10 +6966,8 @@ async function fulfillWalletOrders(env) {
 
   const g2bulkDoc = await getDoc(env, 'settings/g2bulk');
   const jcplaysDoc = await getDoc(env, 'settings/jcplays');
-  const fazercardDoc = await getDoc(env, 'settings/fazercard');
   const g2bulk = (g2bulkDoc && g2bulkDoc.fields) || {};
   const jcplays = (jcplaysDoc && jcplaysDoc.fields) || {};
-  const fazercard = (fazercardDoc && fazercardDoc.fields) || {};
 
   for (const { id } of pending) {
     try {
@@ -7040,9 +7011,7 @@ async function fulfillWalletOrders(env) {
         await fulfillJCPlaysOrder(env, id, doc.fields, jcplays);
       } else if (doc.fields.g2bulkVoucherProductId) {
         await fulfillG2BulkVoucherOrder(env, id, doc.fields, g2bulk);
-      } else if (doc.fields.fazercardCategoryId && doc.fields.fazercardOfferId) {
-        await fulfillFazerCardOrder(env, id, doc.fields, fazercard);
-      } else {
+              } else {
         // No provider linked - nothing can auto-deliver this, so it just
         // moves into the normal Processing queue for an admin to finish
         // by hand (still no Telegram message, still no "Confirm" needed).
@@ -7175,7 +7144,7 @@ async function verifyWalletPrice(env, orderId, f, _fresh) {
   // (Before: price == unit price passed for ANY quantity -> 1000 items for the price of one.)
   const qty = Number(f.quantity === undefined || f.quantity === null || f.quantity === '' ? 1 : f.quantity);
   if (!Number.isInteger(qty) || qty < 1 || qty > 1000) return { ok: false, code: 'bad_value', reason: 'Invalid quantity.' };
-  if (qty > UNIT_LOOP_QTY_CAP && !f.g2bulkGameCode && !f.g2bulkVoucherProductId && (f.jcplaysProductId || f.fazercardOfferId)) {
+  if (qty > UNIT_LOOP_QTY_CAP && !f.g2bulkGameCode && !f.g2bulkVoucherProductId && f.jcplaysProductId) {
     return { ok: false, code: 'bad_value', reason: 'At most ' + UNIT_LOOP_QTY_CAP + ' per order for this item.' };
   }
   const changed = { ok: false, reason: 'The price of this item has changed. Please reopen it and try again.' };
@@ -7190,16 +7159,12 @@ async function verifyWalletPrice(env, orderId, f, _fresh) {
     if (gf.disabled === true) { disabledGame = gf; continue; }
     // Any provider code the order names must be this game's own.
     if ((f.g2bulkGameCode && wStr(f.g2bulkGameCode) !== wStr(gf.g2bulkCode))
-      || (f.jcplaysProduct && wStr(f.jcplaysProduct) !== wStr(gf.jcplaysProduct))
-      || (f.fazercardCategoryId && wStr(f.fazercardCategoryId) !== wStr(gf.fazercardCategoryId))
-      || (f.fazercardGiftCategoryId && wStr(f.fazercardGiftCategoryId) !== wStr(gf.fazercardGiftCategoryId))) { linkBad = true; continue; }
+      || (f.jcplaysProduct && wStr(f.jcplaysProduct) !== wStr(gf.jcplaysProduct))) { linkBad = true; continue; }
     for (const p of (Array.isArray(gf.packages) ? gf.packages : [])) {
       if (!p || typeof p !== 'object' || wStr(p.amount) !== wStr(f.itemAmount)) continue;
       if ((f.g2bulkCatalogueName && wStr(f.g2bulkCatalogueName) !== wStr(p.g2bulk))
         || (f.jcplaysProductId && wStr(f.jcplaysProductId) !== wStr(p.jcplays))
-        || (f.g2bulkVoucherProductId && wStr(f.g2bulkVoucherProductId) !== wStr(p.voucherId))
-        || (f.fazercardOfferId && wStr(f.fazercardOfferId) !== wStr(p.fazercardOfferId))
-        || (f.fazercardGiftCardId && wStr(f.fazercardGiftCardId) !== wStr(p.fazercardGiftCardId))) { linkBad = true; continue; }
+        || (f.g2bulkVoucherProductId && wStr(f.g2bulkVoucherProductId) !== wStr(p.voucherId))) { linkBad = true; continue; }
       const pp = Number(p.price) || 0;
       if (!best || pp < best.price) best = { price: pp, cost: Number(p.cost) || 0, gname: wStr(gf.name), gserver: wStr(gf.serverName), pamount: wStr(p.amount) };
     }
@@ -7556,7 +7521,7 @@ async function sweepStuckProcessingOrders(env) {
   const lines = stuck.map((d) => {
     const f = d.fields;
     const mins = Math.round((now - (Date.parse(f.timestamp) || now)) / 60000);
-    const prov = f.fazercardOrderId ? 'FazerCards' : (f.g2bulkOrderId || f.g2bulkVoucherProductId) ? 'G2Bulk' : f.jcplaysProductId ? 'JCPlays' : 'Manual';
+    const prov = (f.g2bulkOrderId || f.g2bulkVoucherProductId) ? 'G2Bulk' : f.jcplaysProductId ? 'JCPlays' : 'Manual';
     return `• <code>${esc(d.id)}</code> — ${esc(String(f.game || '-'))} · ${Number(f.price || 0).toLocaleString()} MMK · ${mins} min · ${prov}`;
   });
   await tgApi(env, 'sendMessage', { chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML',
@@ -7582,10 +7547,6 @@ async function recordFulfillFailure(env, orderId, priorAttempts, message) {
     }
     if (cur && cur.fields.status !== 'Success' && cur.fields.status !== 'Fail' && g2bulkPlacedUnits(cur.fields).length > 0) {
       await settlePartiallyPlacedG2BulkOrder(env, orderId, cur, message, attempts);
-      return;
-    }
-    if (cur && cur.fields.status !== 'Success' && cur.fields.status !== 'Fail' && fazercardPlacedUnits(cur.fields).length > 0) {
-      await settlePartiallyPlacedFazerCardOrder(env, orderId, cur, message, attempts);
       return;
     }
     await finalizeWalletOrderFailure(env, orderId, `Auto-fulfill failed after ${attempts} attempts: ${message}`, { walletFulfillAttempts: attempts });
@@ -7625,7 +7586,8 @@ async function finalizeWalletOrderFailure(env, orderId, statusNote, extraOrderFi
     && walletWasCharged(doc.fields)
     && !doc.fields.walletRefunded
     && doc.fields.userId
-    && typeof doc.fields.price === 'number';
+    // a debited order with a non-numeric price used to be marked Fail with NO refund and no alert; the debited amount is enough
+    && (typeof doc.fields.price === 'number' || Number(doc.fields.walletDebitedAmount) > 0);
 
   if (!eligibleForRefund) {
     await patchDoc(env, `orders/${orderId}`, { status: 'Fail', statusNote, ...extraOrderFields }, orderFieldPaths);
@@ -8279,7 +8241,7 @@ async function queryProcessingG2BulkGameOrders(env) {
   }), 'orders', 'queryProcessingG2BulkGameOrders', 1000);
   return rows.filter((d) => {
     const f = d.fields || {};
-    if (f.g2bulkVoucherPollUrl || f.fazercardOrderId) return false; // other providers have their own pollers
+    if (f.g2bulkVoucherPollUrl) return false; // other providers have their own pollers
     const subs = Array.isArray(f.g2bulkSubOrders) ? f.g2bulkSubOrders : [];
     return !!f.g2bulkOrderId || subs.some((s) => s && s.g2bulkOrderId);
   });
@@ -8468,7 +8430,6 @@ async function fulfillJCPlaysOrder(env, orderId, fields, jcplays) {
   } catch (err) {
     // JCPlay's own API docs (createorder) confirm it takes no client-supplied
     // order reference/idempotency parameter — unlike every other provider in
-    // this file (G2Bulk's X-Idempotency-Key, FazerCards' Idempotency-Key),
     // there is
     // no way to safely tell JCPlays "this is the same order, don't charge
     // twice." A network blip AFTER JCPlays already deducted the balance and
@@ -8577,132 +8538,36 @@ async function findJCPlaysOrdersMissingCode(env) {
 
   return { scannedCount: orders.length, affectedCount: affected.length, affected };
 }
-// the `fields` keys FazerCards expects at order time for it (almost always
 // ['player_id'], sometimes also a zone/server key) - saved onto
-// games/{id}.fazercardFields at import time by admin.html's
-// importFazerCardCatalogue(). admin.html does this with a plain Object.values
 // scan over its already-loaded GAMES cache; this Worker has no such cache,
 // so it queries Firestore directly instead.
-async function queryGameByFazerCardCategory(env, categoryId) {
-  if (!categoryId) return null;
-  try {
-    const token = await getAccessToken(env);
-    const body = {
-      structuredQuery: {
-        from: [{ collectionId: 'games' }],
-        where: { fieldFilter: { field: { fieldPath: 'fazercardCategoryId' }, op: 'EQUAL', value: { stringValue: categoryId } } },
-        limit: 1
-      }
-    };
-    const res = await fetch(
-      `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery`,
-      { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(body) }
-    );
-    const rows = await res.json();
-    if (!res.ok || !Array.isArray(rows)) return null;
-    const row = rows.find(r => r.document);
-    return row ? decodeFields(row.document.fields || {}) : null;
-  } catch (err) {
-    console.error('queryGameByFazerCardCategory threw', err);
-    return null;
-  }
-}
 
-// Matches FazerCards' documented POST /topups/order (api.fzr.cards/api/v2):
 // category_id/offer_id/fields in the body, X-API-Key + optional
 // Idempotency-Key header. Response is { ok, order: { id, status } }.
-// FazerCards top-ups resolve async with no order-creation webhook wired up
 // yet, so this only places the order and leaves it "Processing" -
-// pollPendingFazerCardOrders() below (run every cron tick, ~1 min) is what
 // actually finishes it, the same role pollPendingVoucherOrders() plays for
 // G2Bulk vouchers.
 //
-// Mirrors admin.html's placeFazerCardOrder(), with one deliberate
 // difference: a missing serverId/playerId sends that field as '' instead of
-// being silently dropped from the JSON body, so a FazerCards-side
 // missing-field rejection is explicit instead of a field just vanishing.
-async function fulfillFazerCardOrder(env, orderId, fields, fazercard) {
-  if (!fazercard.apiKey) return; // not configured yet - leave Pending for the admin to handle
-  if (fazercard.enabled === false) return; // explicitly turned off in the FazerCards Settings modal
-  if ((Number(fields.quantity) || 1) > 1) return await fulfillFazerCardMulti(env, orderId, fields, fazercard); // no qty param -> one call per unit
 
-  const attempts = Number(fields.walletFulfillAttempts || 0);
-  const idempotencyKey = fields.fazercardIdempotencyKey || crypto.randomUUID();
-  if (!fields.fazercardIdempotencyKey) {
-    await patchDoc(env, `orders/${orderId}`, { fazercardIdempotencyKey: idempotencyKey }, ['fazercardIdempotencyKey']);
-  }
-
-  const linkedGame = await queryGameByFazerCardCategory(env, fields.fazercardCategoryId);
-  const fieldKeys = (linkedGame && Array.isArray(linkedGame.fazercardFields) && linkedGame.fazercardFields.length)
-    ? linkedGame.fazercardFields
-    : ['player_id'];
-  const orderFields = {};
-  fieldKeys.forEach(key => {
-    orderFields[key] = /server|zone/i.test(key) ? (fields.serverId || '') : (fields.playerId || '');
-  });
-
-  let data;
-  try {
-    const res = await fetch(`${FAZERCARD_BASE_URL}/topups/order`, {
-      method: 'POST',
-      headers: { 'X-API-Key': fazercard.apiKey, 'Idempotency-Key': idempotencyKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ category_id: fields.fazercardCategoryId, offer_id: fields.fazercardOfferId, fields: orderFields })
-    });
-    data = await res.json();
-    if (!data.ok) throw new Error(data.error || `FazerCards request failed (HTTP ${res.status})`);
-  } catch (err) {
-    await recordFulfillFailure(env, orderId, attempts, 'FazerCards: ' + err.message);
-    return;
-  }
-
-  await patchDoc(env, `orders/${orderId}`, {
-    status: 'Processing',
-    fazercardOrderId: (data.order && data.order.id) || null,
-    fazercardStatus: (data.order && data.order.status) || 'processing'
-  }, ['status', 'fazercardOrderId', 'fazercardStatus']);
-}
-
-// Queries orders sitting "Processing" with a saved fazercardOrderId - same
 // role as queryProcessingVoucherOrders for G2Bulk vouchers: without this, a
-// FazerCards order confirmed via Telegram (or auto-fulfilled from a wallet
 // payment) would sit in "Processing" forever unless an admin happened to
 // have the admin panel open (which only short-polls for ~20s right after
-// placing) or manually pressed "Check FazerCards Status".
 // Pages through every stuck order — same reasoning as
 // queryProcessingVoucherOrders above (no orderBy + a single-page limit would
 // keep re-polling the same subset forever once the backlog outgrew one page).
-async function queryProcessingFazerCardOrders(env) {
-  // Single equality filter + __name__ ordering only -> served by Firestore's automatic
-  // indexes (no composite index needed). fazercardOrderId is filtered in JS instead.
-  const rows = await runQueryPaginated(env, (limit) => ({
-    from: [{ collectionId: 'orders' }],
-    where: {
-      fieldFilter: { field: { fieldPath: 'status' }, op: 'EQUAL', value: { stringValue: 'Processing' } }
-    },
-    orderBy: [
-      { field: { fieldPath: '__name__' }, direction: 'ASCENDING' }
-    ],
-    limit
-  }), 'orders', 'queryProcessingFazerCardOrders', 1000);
-  return rows.filter((d) => d.fields && d.fields.fazercardOrderId);
-}
 
 // ---------------------------------------------------------------------------
-// MULTI-QUANTITY ORDERS for providers WITHOUT a quantity parameter (JCPlays, FazerCards)
 // ---------------------------------------------------------------------------
 // "Diamond pack x3" is placed as 3 separate provider orders (one per unit), exactly like the G2Bulk game top-up loop.
 // Progress is saved on the order after EVERY unit, so a retry / cron tick resumes where it stopped and never
 // re-places (and re-pays) a unit that already went through.
 //   JCPlays   : synchronous, NO idempotency key -> a unit whose answer is unknown is never retried blindly. The order is
 //               parked in "Processing" for a manual check (same safety rule as the single-unit flow).
-//   FazerCards: async + Idempotency-Key -> every unit gets its OWN key (saved before the first call), so retrying is safe;
 //               a poller then follows each unit and settles the order (all done = Success, some failed = partial refund).
 // A unit that was never placed is refunded: price / quantity x units.
 
-function fazercardPlacedUnits(fields) {
-  const subs = Array.isArray(fields && fields.fazercardSubOrders) ? fields.fazercardSubOrders : [];
-  return subs.filter(s => s && s.fazercardOrderId);
-}
 
 // Finish a multi-unit order whose units ALL have a result. subs[].result = 'COMPLETED' | 'FAILED'.
 //  - none failed  -> Success
@@ -8846,161 +8711,12 @@ async function fulfillJCPlaysMulti(env, orderId, fields, jcplays) {
   await settleUnitLoopOrder(env, orderId, subs, 'JCPlays', okFields, { jcplaysSubOrders: subs });
 }
 
-// ---- FazerCards: one topups/order call per unit, each with its own Idempotency-Key ----
-async function fulfillFazerCardMulti(env, orderId, fields, fazercard) {
-  const attempts = Number(fields.walletFulfillAttempts || 0);
-  const quantity = Math.max(1, Number(fields.quantity) || 1);
-  const existing = Array.isArray(fields.fazercardSubOrders) ? fields.fazercardSubOrders : [];
-  const subs = [];
-  let newKeys = false;
-  for (let i = 1; i <= quantity; i++) {
-    const s = { ...(existing.find(x => x && x.index === i) || { index: i }) };
-    if (!s.idempotencyKey) { s.idempotencyKey = crypto.randomUUID(); newKeys = true; }
-    subs.push(s);
-  }
-  const save = (extra = {}) => patchDoc(env, `orders/${orderId}`,
-    { fazercardSubOrders: subs, quantity, ...extra }, ['fazercardSubOrders', 'quantity', ...Object.keys(extra)]);
-  if (newKeys) await save();   // keys are stored BEFORE the first call, so every retry re-sends the same key (no double order)
 
-  const linkedGame = await queryGameByFazerCardCategory(env, fields.fazercardCategoryId);
-  const fieldKeys = (linkedGame && Array.isArray(linkedGame.fazercardFields) && linkedGame.fazercardFields.length)
-    ? linkedGame.fazercardFields : ['player_id'];
-  const orderFields = {};
-  fieldKeys.forEach(key => { orderFields[key] = /server|zone/i.test(key) ? (fields.serverId || '') : (fields.playerId || ''); });
 
-  for (const sub of subs) {
-    if (sub.fazercardOrderId || sub.result) continue;
-    if (subrequestsLeft(env) < 6) { await recordFulfillFailure(env, orderId, attempts, `FazerCards (unit ${sub.index}/${quantity}): Worker subrequest budget used up, will continue next tick`); return; }
-    try {
-      const res = await fetch(`${FAZERCARD_BASE_URL}/topups/order`, {
-        method: 'POST',
-        headers: { 'X-API-Key': fazercard.apiKey, 'Idempotency-Key': sub.idempotencyKey, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ category_id: fields.fazercardCategoryId, offer_id: fields.fazercardOfferId, fields: orderFields })
-      });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || `FazerCards request failed (HTTP ${res.status})`);
-      if (!(data.order && data.order.id)) throw new Error('FazerCards answered without an order id');
-      sub.fazercardOrderId = data.order.id;
-      sub.status = data.order.status || 'processing';
-    } catch (err) {
-      await recordFulfillFailure(env, orderId, attempts, `FazerCards (unit ${sub.index}/${quantity}): ${err.message}`);
-      return;
-    }
-    await save();   // progress after every unit
-  }
 
-  await save({
-    status: 'Processing',
-    fazercardOrderId: subs[0].fazercardOrderId,
-    fazercardStatus: 'processing',
-    fazercardSubOrdersTotal: quantity
-  });
-}
-
-// Some FazerCards units are placed, the rest could not be (retries used up). Unplaced units -> FAILED (notPlaced),
-// the order goes to "Processing"; checkFazerCardUnitsOnce() then settles it and refunds only the unplaced share.
-async function settlePartiallyPlacedFazerCardOrder(env, orderId, doc, message, attempts) {
-  const f = doc.fields;
-  const quantity = Math.max(1, Number(f.quantity) || 1);
-  const existing = Array.isArray(f.fazercardSubOrders) ? f.fazercardSubOrders : [];
-  const subs = [];
-  for (let i = 1; i <= quantity; i++) subs.push({ ...(existing.find(s => s && s.index === i) || { index: i }) });
-  const nowIso = new Date().toISOString();
-  let notPlaced = 0;
-  for (const s of subs) {
-    if (!s.fazercardOrderId && !s.result) { s.result = 'FAILED'; s.resultAt = nowIso; s.notPlaced = true; notPlaced++; }
-  }
-  const placed = subs.filter(s => s.fazercardOrderId).length;
-  const note = `Only ${placed}/${quantity} units could be placed with FazerCards (${String(message).slice(0, 160)}). Placed units are being tracked; the ${notPlaced} unplaced unit(s) will be refunded when they finish.`;
-  await patchDoc(env, `orders/${orderId}`, {
-    status: 'Processing', quantity, fazercardSubOrders: subs, fazercardSubOrdersTotal: quantity,
-    fazercardOrderId: (subs.find(s => s.fazercardOrderId) || {}).fazercardOrderId || null,
-    fazercardStatus: 'partial_placed', statusNote: note,
-    walletFulfillAttempts: attempts, lastFulfillError: String(message).slice(0, 300)
-  }, ['status', 'quantity', 'fazercardSubOrders', 'fazercardSubOrdersTotal', 'fazercardOrderId', 'fazercardStatus', 'statusNote', 'walletFulfillAttempts', 'lastFulfillError']);
-  try {
-    await tgApi(env, 'sendMessage', { chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML',
-      text: `⚠️ <b>Partial FazerCards placement</b>\n\nOrder: <code>${esc(orderId)}</code>\nPlaced: <b>${placed}/${quantity}</b> units. ${notPlaced} unit(s) could not be placed.\n`
-        + `NOT refunded in full - placed units stay Processing, the unplaced share is refunded when they finish.\n<code>${esc(String(message).slice(0, 200))}</code>` });
-  } catch (e) { console.error('settlePartiallyPlacedFazerCard notify failed', e); }
-}
-
-// Poll every unit of a multi-quantity FazerCards order once, then settle if all units have a result.
-async function checkFazerCardUnitsOnce(env, d, fazercard) {
-  try {
-    const subs = d.fields.fazercardSubOrders.map(s => ({ ...s }));
-    let changed = false;
-    for (const sub of subs) {
-      if (sub.result || !sub.fazercardOrderId) continue;
-      if (subrequestsLeft(env) < 8) break;   // finish on the next tick
-      const res = await fetch(`${FAZERCARD_BASE_URL}/orders/${encodeURIComponent(sub.fazercardOrderId)}`, { headers: { 'X-API-Key': fazercard.apiKey } });
-      const data = await res.json().catch(() => ({}));
-      if (!data.ok) continue;
-      const status = String((data.order && data.order.status) || '').toLowerCase();
-      if (!status) continue;
-      if (status !== sub.status) { sub.status = status; changed = true; }
-      if (status === 'completed') { sub.result = 'COMPLETED'; sub.resultAt = new Date().toISOString(); changed = true; }
-      else if (status === 'failed' || status === 'cancelled' || status === 'refunded') { sub.result = 'FAILED'; sub.resultAt = new Date().toISOString(); changed = true; }
-    }
-    const done = subs.filter(s => s.result).length;
-    if (done < subs.length) {
-      if (changed) await patchDoc(env, `orders/${d.id}`, { fazercardSubOrders: subs, fazercardSubOrdersDone: done }, ['fazercardSubOrders', 'fazercardSubOrdersDone']);
-      return;
-    }
-    const failed = subs.filter(s => s.result === 'FAILED').length;
-    await settleUnitLoopOrder(env, d.id, subs, 'FazerCards',
-      { fazercardSubOrders: subs, fazercardSubOrdersDone: done, fazercardStatus: failed ? 'partial' : 'completed' },
-      { fazercardSubOrders: subs, fazercardSubOrdersDone: done, fazercardStatus: 'failed' });
-  } catch (err) {
-    console.error('checkFazerCardUnitsOnce error', d && d.id, err);
-  }
-}
-
-// Checks one Processing order's FazerCards status once and applies it -
-// same status vocabulary as admin.html's checkFazerCardOrderStatus
 // (created/processing/completed/failed/cancelled/refunded).
-async function checkFazerCardOrderStatusOnce(env, orderId, fazercardOrderId, fazercard, currentStatus) {
-  try {
-    const res = await fetch(`${FAZERCARD_BASE_URL}/orders/${encodeURIComponent(fazercardOrderId)}`, {
-      headers: { 'X-API-Key': fazercard.apiKey }
-    });
-    const data = await res.json();
-    if (!data.ok) return;
-    const status = ((data.order && data.order.status) || '').toLowerCase();
 
-    if (status === 'completed') {
-      await patchDoc(env, `orders/${orderId}`, {
-        status: 'Success', confirmedAt: new Date(), fazercardStatus: status
-      }, ['status', 'confirmedAt', 'fazercardStatus']);
-      await notifyOrderStatus(env, orderId, 'Success');
-    } else if (status === 'failed' || status === 'cancelled' || status === 'refunded') {
-      await finalizeWalletOrderFailure(env, orderId, 'FazerCards order failed/refunded.', { fazercardStatus: status });
-    } else if (status && status !== currentStatus) {
-      // Skip the write when nothing changed - this runs every minute per Processing order,
-      // and an identical patch is still a billed write (plus a re-read on every listener).
-      await patchDoc(env, `orders/${orderId}`, { fazercardStatus: status }, ['fazercardStatus']);
-    }
-    // no status in response - leave as-is, next tick tries again
-  } catch (err) {
-    console.error('checkFazerCardOrderStatusOnce error', orderId, err);
-  }
-}
-
-// Called once per cron tick (see runCronSweep) - the FazerCards counterpart
 // to pollPendingVoucherOrders.
-async function pollPendingFazerCardOrders(env) {
-  const fazercardDoc = await getDoc(env, 'settings/fazercard');
-  const fazercard = (fazercardDoc && fazercardDoc.fields) || {};
-  if (!fazercard.apiKey) return;
-  const stuck = await queryProcessingFazerCardOrders(env);
-  for (const d of stuck) {
-    if (Array.isArray(d.fields.fazercardSubOrders) && d.fields.fazercardSubOrders.length > 1) {
-      await checkFazerCardUnitsOnce(env, d, fazercard);   // multi-quantity order: one status per unit
-    } else {
-      await checkFazerCardOrderStatusOnce(env, d.id, d.fields.fazercardOrderId, fazercard, d.fields.fazercardStatus);
-    }
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Webhook — handle Confirm/Reject button presses
@@ -9326,20 +9042,17 @@ async function resolveOrder(env, orderId, status, cb, statusLine, preDoc) {
     const isG2Bulk = !!(doc.fields.g2bulkGameCode && doc.fields.g2bulkCatalogueName);
     const isJCPlays = !isG2Bulk && !!doc.fields.jcplaysProductId;
     const isVoucher = !isG2Bulk && !isJCPlays && !!doc.fields.g2bulkVoucherProductId;
-    const isFazerCard = !isG2Bulk && !isJCPlays && !isVoucher && !!(doc.fields.fazercardCategoryId && doc.fields.fazercardOfferId);
 
-    if (isG2Bulk || isJCPlays || isVoucher || isFazerCard) {
+    if (isG2Bulk || isJCPlays || isVoucher) {
       // Speed: independent reads, fetched together (was 3 sequential round trips before the
       // admin's button spinner could even be answered).
-      const [g2bulkDoc, jcplaysDoc, fazercardDoc] = await Promise.all([
+      const [g2bulkDoc, jcplaysDoc] = await Promise.all([
         getDoc(env, 'settings/g2bulk'),
-        getDoc(env, 'settings/jcplays'),
-        getDoc(env, 'settings/fazercard')
+        getDoc(env, 'settings/jcplays')
       ]);
       const g2bulk = (g2bulkDoc && g2bulkDoc.fields) || {};
       const jcplays = (jcplaysDoc && jcplaysDoc.fields) || {};
-      const fazercard = (fazercardDoc && fazercardDoc.fields) || {};
-      const providerLabel = isG2Bulk ? 'G2Bulk' : isJCPlays ? 'JCPlays' : isVoucher ? 'G2Bulk (Voucher)' : 'FazerCards';
+      const providerLabel = isG2Bulk ? 'G2Bulk' : isJCPlays ? 'JCPlays' : isVoucher ? 'G2Bulk (Voucher)' : '';
 
       // G2Bulk (direct and voucher) charges the wallet at order time but
       // accepts the order into its queue even when the balance can't cover
@@ -9378,7 +9091,6 @@ async function resolveOrder(env, orderId, status, cb, statusLine, preDoc) {
       if (isG2Bulk) await fulfillG2BulkOrder(env, orderId, doc.fields, g2bulk);
       else if (isJCPlays) await fulfillJCPlaysOrder(env, orderId, doc.fields, jcplays);
       else if (isVoucher) await fulfillG2BulkVoucherOrder(env, orderId, doc.fields, g2bulk);
-      else if (isFazerCard) await fulfillFazerCardOrder(env, orderId, doc.fields, fazercard);
 
       // Re-read after fulfillment - it may have already resolved to
       // Success (JCPlays/instant voucher delivery) or Fail (rejected by the
@@ -9475,8 +9187,7 @@ async function resolveOrder(env, orderId, status, cb, statusLine, preDoc) {
 // ---------------------------------------------------------------------------
 // CUSTOMER DMs as Rich cards (table + button), sent straight from the customer bot (linngamestorebot).
 // Needs the customer bot's token as env STORE_BOT_TOKEN (optional env STORE_WEBAPP_URL = the Mini App link for the
-// "Open Linn Game Store" button). Without STORE_BOT_TOKEN - or if Telegram refuses the rich card - the old
-// callAuthWorker() path is used, so nothing breaks.
+// "Open Linn Game Store" button). Without STORE_BOT_TOKEN no Telegram DM is sent.
 // ---------------------------------------------------------------------------
 async function sendStoreRichCard(env, telegramId, title, rows, tail) {
   if (!env.STORE_BOT_TOKEN || !telegramId) return false;
@@ -9533,9 +9244,8 @@ async function sendTopupRichDm(env, telegramId, amount, status, balance) {
 
 // DMs the customer back inside linngamestorebot's own chat once a human
 // resolves their order via the Telegram Confirm/Reject buttons here —
-// calls gamestore-auth-worker.js's EXISTING /notify-order-status endpoint,
-// the same one admin.html already calls when an order is resolved from
-// the web panel, so this just closes the same gap for the Telegram-button
+// sends the rich card straight from the customer bot (needs STORE_BOT_TOKEN),
+// closing the gap for the Telegram-button
 // path (mirrors notifyTopupCustomer() below for wallet top-ups). Looks up
 // users/{userId}.telegramId - store.html writes that once a customer links
 // Telegram via the Mini App; an order from someone who never linked
@@ -9560,22 +9270,7 @@ async function notifyOrderDm(env, orderId, fields, status) {
     const userDoc = await getDoc(env, `users/${userId}`);
     const telegramId = userDoc && userDoc.fields.telegramId;
     if (!telegramId) return;
-    const secretDoc = await getDoc(env, 'settings/adminBroadcast');
-    const secret = (secretDoc && secretDoc.fields.secret) || env.ADMIN_BROADCAST_SECRET || '';
-    if (!secret) { console.error('notifyOrderDm: no adminBroadcast secret configured'); return; }
-    if (await sendOrderRichDm(env, telegramId, orderId, fields, status, userDoc.fields.walletBalance)) return;   // rich table + button card
-    const res = await callAuthWorker(env, '/notify-order-status', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        secret, telegramId, orderId, status,
-        game: fields.game || '', price: fields.price || 0,
-        userName: resolvedCustomerLabel(fields), userId,
-        inGameId: fields.playerId || '', serverId: fields.serverId || '',
-        packageName: fields.itemAmount || '',
-      }),
-    });
-    if (!res.ok) console.error('notifyOrderDm failed', res.status, await res.text());
+    await sendOrderRichDm(env, telegramId, orderId, fields, status, userDoc.fields.walletBalance);   // rich table + button card (needs STORE_BOT_TOKEN)
   } catch (err) {
     console.error('notifyOrderDm error', err);
   }
@@ -9621,15 +9316,9 @@ async function resolveTopupConfirm(env, topupId, cb, preDoc) {
     await answerCallback(env, cb.id, `Already ${doc.fields.status}.`);
     return;
   }
-  // Crypto top-ups self-verify against FazerCards' own payment status (see
-  // fazercards-functions Worker's /fazercard-payment-status) and must never
   // be credited by a human tap - that would credit a balance nobody has
   // actually paid for yet. The sweep above should never send these to
   // Telegram in the first place; this is just the second layer of defense.
-  if (doc.fields.fazercardPaymentId) {
-    await answerCallback(env, cb.id, 'This is a crypto top up - it credits itself once FazerCards confirms payment. Do not confirm manually.');
-    return;
-  }
   if (topupNeedsReceipt(doc.fields)) { await answerCallback(env, cb.id, NO_RECEIPT_MSG, true); return; }
   const dualNeeded = dualApprovalRequired(env, Number(doc.fields.amount) || 0);
   const a1 = String(doc.fields.firstApprovalBy || ''), a2 = String(doc.fields.secondApprovalBy || '');
@@ -9688,7 +9377,7 @@ async function resolveTopup(env, topupId, status, cb, statusLine) {
 }
 
 // DMs the customer back inside linngamestorebot's own chat (via
-// gamestore-auth-worker.js's /notify-topup-status) once a human resolves
+// the customer bot) once a human resolves
 // their wallet top-up here. Only fires when the topup doc actually has a
 // telegramId (only true for top-ups submitted through that bot's own
 // in-chat flow — a store.html web top-up has no Telegram chat to DM back
@@ -9718,21 +9407,11 @@ async function notifyTopupCustomer(env, doc, status) {
   }
   telegramId = String(telegramId);
   try {
-    const secretDoc = await getDoc(env, 'settings/adminBroadcast');
-    const secret = (secretDoc && secretDoc.fields.secret) || env.ADMIN_BROADCAST_SECRET || '';
-    if (!secret) { console.error('notifyTopupCustomer: no adminBroadcast secret configured'); return; }
     if (env.STORE_BOT_TOKEN) {
       let bal = null;
       try { const ud = doc.fields.userId ? await getDoc(env, `users/${doc.fields.userId}`) : null; if (ud) bal = ud.fields.walletBalance; } catch (e) { /* balance line is optional */ }
-      if (await sendTopupRichDm(env, telegramId, doc.fields.amount, status, bal)) return;
+      await sendTopupRichDm(env, telegramId, doc.fields.amount, status, bal);
     }
-    const res = await callAuthWorker(env, '/notify-topup-status', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ secret, telegramId, amount: doc.fields.amount || 0, status }),
-    });
-    if (!res.ok) console.error('notifyTopupCustomer failed', res.status, await res.text());
-    else console.log('notifyTopupCustomer: delivered request OK for telegramId', telegramId, 'status', status);
   } catch (err) {
     console.error('notifyTopupCustomer error', err);
   }
@@ -9769,7 +9448,7 @@ async function notifyTopupCustomer(env, doc, status) {
 
 const GOOGLE_SECURETOKEN_JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
 const AUTH_ADMIN_SCOPE = 'https://www.googleapis.com/auth/cloud-platform';
-const PROVIDER_FLAG_KEYS = ['g2bulk', 'fazercard', 'jcplays'];
+const PROVIDER_FLAG_KEYS = ['g2bulk', 'jcplays'];
 
 let cachedJwks = null;            // { keys: { [kid]: CryptoKey }, expires, fetchedAt }
 let cachedAuthAdminToken = null;  // { token, expires }
@@ -10136,7 +9815,7 @@ async function syncAdminClaims(env) {
   for (const p of PROVIDER_FLAG_KEYS) {
     const d = await getDoc(env, `settings/${p}`);
     flags[p] = !(d && d.fields.enabled === false);
-    flags[p + 'ComingSoon'] = !!(d && d.fields.comingSoon === true);   // admin "Coming Soon" switch (P2 = fazercard)
+    flags[p + 'ComingSoon'] = !!(d && d.fields.comingSoon === true);   // admin "Coming Soon" switch
   }
   await patchDoc(env, 'settings/providerFlags', flags, PROVIDER_FLAG_KEYS.concat(PROVIDER_FLAG_KEYS.map(k => k + 'ComingSoon')));
   summary.providerFlags = flags;
@@ -10654,7 +10333,7 @@ async function handleOrderGet(request, env) {
 
 const ORDER_STR_FIELDS = ['playerId', 'serverId', 'serverRegion', 'inGameName', 'game', 'itemAmount',
   'g2bulkGameCode', 'g2bulkCatalogueName', 'jcplaysProduct', 'jcplaysProductId', 'g2bulkVoucherProductId',
-  'fazercardCategoryId', 'fazercardOfferId', 'fazercardGiftCategoryId', 'fazercardGiftCardId', 'orderCode', 'charName'];
+  'orderCode', 'charName'];
 
 
 // ---------------------------------------------------------------------------
@@ -11188,7 +10867,7 @@ async function handleOrderCreate(request, env, ctx) {
   }
   // Voucher / gift-card codes are delivered to the customer, not credited to a game account,
   // so they carry no In-Game ID. Every other order still needs one.
-  const isCodeOrder = !!(fields.g2bulkVoucherProductId || fields.fazercardGiftCardId || fields.jcplaysProductId);
+  const isCodeOrder = !!(fields.g2bulkVoucherProductId || fields.jcplaysProductId);
   if ((!fields.playerId && !isCodeOrder) || !fields.game || !fields.itemAmount) return topupJson(request, { ok: false, error: 'Missing order details.' }, 400);
   if (body.location && typeof body.location === 'object' && JSON.stringify(body.location).length <= 600) fields.location = body.location;
 
