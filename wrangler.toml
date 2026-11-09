@@ -3,6 +3,13 @@ name = "linnmanagebot"              # MUST equal the Worker name in the dashboar
 main = "linnmanagebot.js"           # <- your file name in the repo
 compatibility_date = "2025-09-01"
 
+# Keep any plain-text variables you set in the dashboard when GitHub deploys this file.
+keep_vars = true
+
+# Store address: used for "tap the notification -> open that order / wallet".
+[vars]
+STORE_URL = "https://linngamestore.com"
+
 [triggers]
 crons = ["*/2 * * * *", "1-59/4 * * * *"]
 
