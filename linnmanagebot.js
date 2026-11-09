@@ -6512,7 +6512,7 @@ async function sweepNotificationBroadcasts(env) {
       if (u.fields.pushPrefs && typeof u.fields.pushPrefs === 'object' && u.fields.pushPrefs.promo === false) continue; // customer turned promo alerts off
       const wantMy = u.fields.pushLang === 'my' && (titleMy || bodyMy);
       const title = wantMy ? (titleMy || titleEn) : titleEn, body = wantMy ? (bodyMy || bodyEn) : bodyEn;
-      const send = await sendFcmPush(env, u.fields.fcmToken, title, body, { notifId: n.id }, (typeof n.fields.imageUrl === 'string' && /^https:\/\//i.test(n.fields.imageUrl)) ? n.fields.imageUrl : ''), { icon: '/noti-promo.png' };
+      const send = await sendFcmPush(env, u.fields.fcmToken, title, body, { notifId: n.id }, (typeof n.fields.imageUrl === 'string' && /^https:\/\//i.test(n.fields.imageUrl)) ? n.fields.imageUrl : '', { icon: '/noti-promo.png' });
       const errStatus = send && !send.ok && send.result && send.result.error && send.result.error.status;
       if (errStatus === 'NOT_FOUND' || errStatus === 'INVALID_ARGUMENT') {
         await patchDoc(env, `users/${u.id}`, { fcmToken: null }, ['fcmToken']);
