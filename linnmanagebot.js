@@ -766,6 +766,23 @@ export default {
     // top-up is saved, so it reaches Telegram (or auto-fulfils) right away
     // instead of waiting for the next cron tick. See handlePing() below.
     // Per-admin 6-digit PIN (set / verify / status). Admin ID token required.
+    if (url.pathname === '/admin-test-push') {
+      if (request.method === 'OPTIONS') return corsPreflightAdmin();
+      if (request.method === 'POST') {
+        try { return await handleAdminTestPush(request, env); }
+        catch (err) { console.error('/admin-test-push failed', err); return corsJsonAdmin({ ok: false, error: 'Server error' }, 500); }
+      }
+    }
+
+    // Confirm / Reject tapped on a phone notification (service worker calls this; signed one-time-style token, no login).
+    if (url.pathname === '/admin-push-action') {
+      if (request.method === 'OPTIONS') return corsPreflightAdmin();
+      if (request.method === 'POST') {
+        try { return await handleAdminPushAction(request, env); }
+        catch (err) { console.error('/admin-push-action failed', err); return corsJsonAdmin({ ok: false, error: 'Server error' }, 500); }
+      }
+    }
+
     if (url.pathname === '/admin-pin') {
       if (request.method === 'OPTIONS') return corsPreflightAdmin();
       if (request.method === 'POST') {
@@ -1607,23 +1624,44 @@ async function commitWrites(env, writes, opts) {
 // on the Push Notifications toggle.
 // ---------------------------------------------------------------------------
 
-async function sendFcmPush(env, fcmToken, title, body, data = {}, image = '') {
+// Notification language the customer chose in the app ('my' | 'en'); default English.
+function pushLangOf(userDoc) { return userDoc && userDoc.fields && userDoc.fields.pushLang === 'my' ? 'my' : 'en'; }
+
+async function sendFcmPush(env, fcmToken, title, body, data = {}, image = '', opts = {}) {
   if (!fcmToken) return null;
   try {
     const accessToken = await getAccessToken(env);
+    // FCM data values must all be strings.
+    const strData = {};
+    for (const [k, v] of Object.entries(data || {})) strData[k] = String(v);
+    // High urgency + 1 day TTL: the push still arrives when the phone is idle / was offline.
+    const webpush = { headers: { Urgency: 'high', TTL: '86400' } };
+    let message;
+    if (opts.dataOnly) {
+      // Data-only: the service worker (firebase-messaging-sw.js) draws the notification itself,
+      // so the app's own icon/badge/title are used. Used for admin devices (web only).
+      message = {
+        token: fcmToken,
+        data: { ...strData, title: String(title), body: String(body), ...(image ? { image } : {}) },
+        webpush
+      };
+    } else {
+      // Customers: keep the normal notification payload (the native Capacitor app needs it).
+      webpush.fcm_options = { link: opts.link || '/' };
+      webpush.notification = { icon: opts.icon || '/favicon-192.png?v=4', badge: '/badge-96.png' };
+      message = {
+        token: fcmToken,
+        notification: { title, body, ...(image ? { image } : {}) },
+        data: strData,
+        webpush
+      };
+    }
     const res = await fetch(
       `https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/messages:send`,
       {
         method: 'POST',
         headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: {
-            token: fcmToken,
-            notification: { title, body, ...(image ? { image } : {}) },
-            data,
-            webpush: { fcm_options: { link: '/' } }
-          }
-        })
+        body: JSON.stringify({ message })
       }
     );
     const result = await res.json().catch(() => ({}));
@@ -1938,6 +1976,22 @@ async function creditUserStats(env, orderId, preloaded = null) {
   }
 }
 
+let _gameImgCache = { at: 0, rows: [] };
+async function lookupOrderGameImage(env, f) {
+  try {
+    if (!f || !f.game) return '';
+    if (!_gameImgCache.rows.length || Date.now() - _gameImgCache.at > 10 * 60 * 1000) {
+      if (subrequestsLeft(env) < 10) return '';
+      const docs = await queryAllDocs(env, 'games');
+      _gameImgCache = { at: Date.now(), rows: docs.map(d => ({ n: d.fields.name, s: d.fields.serverName || '', i: d.fields.image })) };
+    }
+    const c = _gameImgCache.rows.filter(r => r.n === f.game && typeof r.i === 'string' && /^https:\/\//i.test(r.i));
+    if (!c.length) return '';
+    const exact = f.serverRegion ? c.find(r => r.s === f.serverRegion) : null;
+    return (exact || c.find(r => !r.s) || c[0]).i;
+  } catch (e) { return ''; }
+}
+
 async function notifyOrderStatus(env, orderId, status, preloadedOrderDoc = null) {
   try {
     // Count a finished order into userStats FIRST (own atomic claim, independent of the push claim below).
@@ -1992,16 +2046,27 @@ async function notifyOrderStatus(env, orderId, status, preloadedOrderDoc = null)
     }
 
     if (!fcmToken) return;
+    const _pp = userDoc && userDoc.fields && userDoc.fields.pushPrefs;
+    if (_pp && typeof _pp === 'object' && _pp.order === false) return; // customer turned order alerts off
 
-    const gameName = orderDoc.fields.game || 'your order';
-    const title = status === 'Success' ? 'Order Completed ✅' : 'Order Failed ❌';
+    const my = pushLangOf(userDoc) === 'my';
+    const gameName = orderDoc.fields.game || (my ? 'သင့် Order' : 'your order');
+    const refundAmt = Number(orderDoc.fields.price || 0).toLocaleString();
+    const title = status === 'Success'
+      ? (my ? 'Order ပြီးစီးပါပြီ ✅' : 'Order Completed ✅')
+      : (my ? 'Order မအောင်မြင်ပါ ❌' : 'Order Failed ❌');
     const body = status === 'Success'
-      ? `${gameName} — delivered successfully.`
+      ? (my ? `🎮 ${gameName} — အောင်မြင်စွာ ပို့ဆောင်ပြီးပါပြီ။` : `🎮 ${gameName} — delivered successfully.`)
       : orderDoc.fields.walletRefunded
-        ? `${gameName} — order failed. ${Number(orderDoc.fields.price || 0).toLocaleString()} MMK was refunded to your Wallet.`
-        : `${gameName} — order failed. Tap to see details.`;
+        ? (my ? `🎮 ${gameName} — မအောင်မြင်ပါ။ 💰 ${refundAmt} MMK ကို သင့် Wallet ထဲ ပြန်အမ်းပြီးပါပြီ။`
+              : `🎮 ${gameName} — order failed. 💰 ${refundAmt} MMK was refunded to your Wallet.`)
+        : (my ? `🎮 ${gameName} — မအောင်မြင်ပါ။ အသေးစိတ်ကြည့်ရန် နှိပ်ပါ။` : `🎮 ${gameName} — order failed. Tap to see details.`);
 
-    const send = await sendFcmPush(env, fcmToken, title, body, { orderId, status });
+    // Orders do not store the game picture, so it is looked up in `games` (cached 10 min) by name + server.
+    const _img = [orderDoc.fields.gameImage, orderDoc.fields.gameImg, orderDoc.fields.image, orderDoc.fields.imageUrl]
+      .find(u => typeof u === 'string' && /^https:\/\//i.test(u)) || await lookupOrderGameImage(env, orderDoc.fields);
+    const send = await sendFcmPush(env, fcmToken, title, body, { orderId, status }, _img,
+      { link: storeLink(env, '?order=' + encodeURIComponent(orderId)), icon: status === 'Success' ? '/noti-success.png' : '/noti-fail.png' });
     const errStatus = send && !send.ok && send.result && send.result.error && send.result.error.status;
     if (errStatus === 'NOT_FOUND' || errStatus === 'INVALID_ARGUMENT') {
       await patchDoc(env, `users/${orderDoc.fields.userId}`, { fcmToken: null }, ['fcmToken']);
@@ -2022,31 +2087,330 @@ async function notifyOrderStatus(env, orderId, status, preloadedOrderDoc = null)
 // A short in-memory cache avoids re-fetching adminDevices on every single
 // item within one cron tick (there can be several new orders per minute).
 // ---------------------------------------------------------------------------
+// Absolute store link for "tap the notification -> open that order". Needs the STORE_URL variable
+// (e.g. https://yourdomain.com) in the Worker settings; without it the link stays '/' exactly as before.
+function storeLink(env, query) {
+  const base = String(env.STORE_URL || '').trim().replace(/\/+$/, '');
+  return /^https:\/\//i.test(base) ? base + '/' + (query || '') : '';
+}
+
+// "Received" pushes: bank-transfer order placed / wallet top-up request placed (admin has not confirmed yet).
+async function notifyOrderReceived(env, orderId, o) {
+  try {
+    const userDoc = await getDoc(env, `users/${o.userId}`);
+    const token = userDoc && userDoc.fields.fcmToken;
+    if (!token) return;
+    const pp = userDoc.fields.pushPrefs;
+    if (pp && typeof pp === 'object' && pp.order === false) return;
+    const my = pushLangOf(userDoc) === 'my';
+    const game = o.game || (my ? 'သင့် Order' : 'your order');
+    const item = o.itemAmount ? ' · ' + o.itemAmount : '';
+    const send = await sendFcmPush(env, token,
+      my ? 'Order လက်ခံပြီးပါပြီ 🕒' : 'Order Received 🕒',
+      my ? `🎮 ${game}${item} — စစ်ဆေးပြီး မကြာခင် ဖြည့်ပေးပါမယ်။` : `🎮 ${game}${item} — we're checking it and will deliver shortly.`,
+      { orderId, status: 'Pending' }, '', { link: storeLink(env, '?order=' + encodeURIComponent(orderId)), icon: '/noti-pending.png' });
+    const es = send && !send.ok && send.result && send.result.error && send.result.error.status;
+    if (es === 'NOT_FOUND' || es === 'INVALID_ARGUMENT') await patchDoc(env, `users/${o.userId}`, { fcmToken: null }, ['fcmToken']);
+  } catch (err) { console.error('notifyOrderReceived error', orderId, err); }
+}
+async function notifyTopupReceived(env, topupId, userId, amount) {
+  try {
+    const userDoc = await getDoc(env, `users/${userId}`);
+    const token = userDoc && userDoc.fields.fcmToken;
+    if (!token) return;
+    const pp = userDoc.fields.pushPrefs;
+    if (pp && typeof pp === 'object' && pp.wallet === false) return;
+    const my = pushLangOf(userDoc) === 'my';
+    const amt = Number(amount || 0).toLocaleString();
+    const send = await sendFcmPush(env, token,
+      my ? 'Top Up လက်ခံပြီးပါပြီ 🕒' : 'Top Up Received 🕒',
+      my ? `💰 ${amt} MMK တောင်းဆိုမှု ရရှိပါပြီ။ စစ်ဆေးနေပါတယ်။` : `💰 ${amt} MMK request received. We're checking it now.`,
+      { topupId, kind: 'wallet' }, '', { link: storeLink(env, '?page=wallet'), icon: '/noti-pending.png' });
+    const es = send && !send.ok && send.result && send.result.error && send.result.error.status;
+    if (es === 'NOT_FOUND' || es === 'INVALID_ARGUMENT') await patchDoc(env, `users/${userId}`, { fcmToken: null }, ['fcmToken']);
+  } catch (err) { console.error('notifyTopupReceived error', topupId, err); }
+}
+
+// Wallet top-up credited -> customer push. Claims pushNotifiedAt first so the Telegram-confirm path
+// and the catch-up sweep can never both send it.
+async function notifyTopupCompleted(env, topupId, topupFields) {
+  try {
+    const userId = topupFields && topupFields.userId;
+    if (!userId) return;
+    const fresh = await getDoc(env, `walletTopups/${topupId}`);
+    if (!fresh || fresh.fields.status !== 'Completed' || fresh.fields.pushNotifiedAt) return;
+    await patchDoc(env, `walletTopups/${topupId}`, { pushNotifiedAt: new Date() }, ['pushNotifiedAt']);
+    const userDoc = await getDoc(env, `users/${userId}`);
+    const token = userDoc && userDoc.fields.fcmToken;
+    if (!token) return;
+    const pp = userDoc.fields.pushPrefs;
+    if (pp && typeof pp === 'object' && pp.wallet === false) return;
+    const amt = Number(fresh.fields.amount || topupFields.amount || 0);
+    const myT = pushLangOf(userDoc) === 'my';
+    const send = await sendFcmPush(env, token, myT ? 'Wallet ငွေဖြည့်ပြီးပါပြီ ✅' : 'Wallet Top Up ✅',
+      myT ? `💰 ${amt.toLocaleString()} MMK ကို သင့် Wallet ထဲ ထည့်ပြီးပါပြီ။` : `💰 ${amt.toLocaleString()} MMK has been added to your Wallet.`, { topupId, kind: 'wallet' }, '',
+      { link: storeLink(env, '?page=wallet'), icon: '/noti-wallet.png' });
+    const errStatus = send && !send.ok && send.result && send.result.error && send.result.error.status;
+    if (errStatus === 'NOT_FOUND' || errStatus === 'INVALID_ARGUMENT') {
+      await patchDoc(env, `users/${userId}`, { fcmToken: null }, ['fcmToken']);
+    }
+  } catch (err) { console.error('notifyTopupCompleted error', topupId, err); }
+}
+
+// Safety net for top-ups credited from the admin panel (browser) instead of Telegram: last hour only, max 3 per run.
+async function sweepUnnotifiedTopupPushes(env) {
+  const sinceIso = new Date(Date.now() - 3600 * 1000).toISOString();
+  const docs = await runQueryPaginated(env, (limit) => ({
+    from: [{ collectionId: 'walletTopups' }],
+    where: { fieldFilter: { field: { fieldPath: 'timestamp' }, op: 'GREATER_THAN_OR_EQUAL', value: { timestampValue: sinceIso } } },
+    orderBy: [
+      { field: { fieldPath: 'timestamp' }, direction: 'ASCENDING' },
+      { field: { fieldPath: '__name__' }, direction: 'ASCENDING' }
+    ],
+    select: { fields: ['status', 'pushNotifiedAt', 'userId', 'amount'].map(f => ({ fieldPath: f })) },
+    limit
+  }), 'walletTopups', 'sweepUnnotifiedTopupPushes', 300);
+  let handled = 0;
+  for (const d of docs) {
+    if (d.fields.status !== 'Completed' || d.fields.pushNotifiedAt || !d.fields.userId) continue;
+    if (handled >= 3 || subrequestsLeft(env) < 12) return;
+    await notifyTopupCompleted(env, d.id, d.fields);
+    handled++;
+  }
+}
+
 let _adminDevicesCache = null;
-async function getAdminDeviceTokens(env) {
+async function getAdminDevices(env) {
   if (_adminDevicesCache) return _adminDevicesCache;
   try {
     const docs = await queryAllDocs(env, 'adminDevices');
-    _adminDevicesCache = docs.map(d => d.id).filter(Boolean);
+    _adminDevicesCache = docs.filter(d => d && d.id).map(d => ({ id: d.id, f: d.fields || {} }));
   } catch (err) {
-    console.error('getAdminDeviceTokens error', err);
+    console.error('getAdminDevices error', err);
     _adminDevicesCache = [];
   }
   return _adminDevicesCache;
 }
 
+// Which pref checkbox (adminDevices/{token}.prefs.*) controls each push type.
+const ADMIN_PUSH_TYPE_KEY = { order: 'order', walletTopup: 'topup', supportChat: 'chat', reminder: 'reminder' };
+
+// Myanmar time (UTC+6:30) as minutes since midnight - used for each device's quiet hours.
+function mmtMinutes() {
+  const d = new Date(Date.now() + 6.5 * 3600 * 1000);
+  return d.getUTCHours() * 60 + d.getUTCMinutes();
+}
+function inQuietHours(f) {
+  if (!f || f.quietOn !== true) return false;
+  const p = (s, def) => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(s || def)); return m ? (+m[1]) * 60 + (+m[2]) : null; };
+  const a = p(f.quietFrom, '23:00'), b = p(f.quietTo, '07:00'), now = mmtMinutes();
+  if (a === null || b === null || a === b) return false;
+  return a < b ? (now >= a && now < b) : (now >= a || now < b);
+}
+
+// Keeps the last 30 admin pushes in ONE doc (settings/adminPushLog) so the admin panel can show
+// "what was sent / did it reach a device". Skipped when the cron run is short on subrequests.
+async function logAdminPush(env, entry) {
+  try {
+    if (subrequestsLeft(env) < 15) return;
+    const cur = await getDoc(env, 'settings/adminPushLog');
+    const items = (cur && Array.isArray(cur.fields.items)) ? cur.fields.items : [];
+    items.unshift({ ts: new Date().toISOString(), ...entry });
+    await patchDoc(env, 'settings/adminPushLog', { items: items.slice(0, 30) }, ['items']);
+  } catch (e) { console.error('logAdminPush failed', e); }
+}
+
+// ---------------------------------------------------------------------------
+// Notification action buttons: Confirm / Reject straight from the phone's notification.
+// Every admin push for a single order / top-up carries a signed token (HMAC of kind|id|device|expiry,
+// key = PUSH_ACTION_SECRET, or TELEGRAM_WEBHOOK_SECRET when that is not set). The service worker sends it
+// back to /admin-push-action; the Worker re-checks the signature, that the device is still registered in
+// adminDevices, and then runs the SAME code path as the Telegram Confirm / Reject buttons.
+// Amounts at or above PIN_AMOUNT_THRESHOLD never get action buttons - those still need the admin PIN.
+// ---------------------------------------------------------------------------
+const PUSH_ACTION_TTL_MS = 6 * 3600 * 1000;
+async function pushActionSig(env, kind, id, dev, exp) {
+  const secret = String(env.PUSH_ACTION_SECRET || env.TELEGRAM_WEBHOOK_SECRET || '');
+  if (!secret) return '';
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode('push-action:' + secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode([kind, id, dev, exp].join('|')));
+  return Array.from(new Uint8Array(sig)).map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
+async function handleAdminPushAction(request, env) {
+  let b = {};
+  try { b = await request.json(); } catch (e) { /* empty */ }
+  const kind = b.kind === 'topup' ? 'topup' : b.kind === 'order' ? 'order' : '';
+  const act = b.act === 'reject' ? 'reject' : b.act === 'confirm' ? 'confirm' : '';
+  const id = String(b.id || ''), dev = String(b.dev || ''), exp = Number(b.exp || 0);
+  if (!kind || !act || !/^[A-Za-z0-9_.:-]{1,120}$/.test(id) || !dev || dev.length > 4096 || !exp) {
+    return corsJsonAdmin({ ok: false, error: 'Bad request' }, 400);
+  }
+  if (exp < Date.now()) return corsJsonAdmin({ ok: false, error: 'Expired - open the panel' }, 410);
+  const want = await pushActionSig(env, kind, id, dev, exp);
+  if (!want || !timingSafeEqualStr(String(b.sig || ''), want)) return corsJsonAdmin({ ok: false, error: 'Not authorised' }, 403);
+
+  const devDoc = await getDoc(env, `adminDevices/${dev}`);
+  if (!devDoc) return corsJsonAdmin({ ok: false, error: 'Device not registered' }, 403);
+  const username = String(devDoc.fields.username || '');
+  const meDoc = username ? await getDoc(env, `adminUsernames/${username}`) : null;
+  if (!meDoc) return corsJsonAdmin({ ok: false, error: 'Admin account not found' }, 403);
+  const me = { id: username, fields: meDoc.fields };
+
+  const doc = await getDoc(env, kind === 'order' ? `orders/${id}` : `walletTopups/${id}`);
+  if (!doc) return corsJsonAdmin({ ok: false, error: 'Not found (deleted or archived)' }, 404);
+  if (doc.fields.status !== 'Pending' && !(kind === 'order' && act === 'reject' && doc.fields.status === 'Processing')) {
+    return corsJsonAdmin({ ok: true, already: true, status: doc.fields.status });
+  }
+  const amt = Number(kind === 'order' ? doc.fields.price : doc.fields.amount) || 0;
+  if (act === 'confirm') {
+    try { const m = await getMaintenance(env, true); if (m && m.enabled) return corsJsonAdmin({ ok: false, error: 'Maintenance is ON' }); } catch (e) { /* fail open, same as the Telegram button */ }
+    if (amt >= PIN_AMOUNT_THRESHOLD) return corsJsonAdmin({ ok: false, needsPin: true, error: 'Amount needs the admin PIN - open the panel or Telegram' });
+    if (kind === 'topup' && topupNeedsReceipt(doc.fields)) return corsJsonAdmin({ ok: false, error: NO_RECEIPT_MSG });
+  }
+
+  const cb = {
+    id: 'pin-push-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),   // 'pin-' ids collect answers instead of calling Telegram
+    from: { id: meDoc.fields.telegramChatId || 0, first_name: username },
+    message: null
+  };
+  _pinAnswers.set(cb.id, []);
+  let note = '';
+  try {
+    if (kind === 'order') {
+      if (act === 'confirm') await resolveOrder(env, id, 'Processing', cb, '⏳ <b>MOVED TO PROCESSING</b>');
+      else await resolveOrder(env, id, 'Fail', cb, '❌ <b>REJECTED</b>');
+    } else if (act === 'confirm') {
+      const r = await dualConfirmTopup(env, me, id, cb);
+      if (r && r.text) note = r.text;
+    } else {
+      await resolveTopup(env, id, 'Rejected', cb, '❌ <b>REJECTED</b>');
+    }
+    const answers = (_pinAnswers.get(cb.id) || []).map(a => a.text).filter(t => !/^Confirmed — placing/.test(t));
+    if (!note && answers.length) note = answers.join(' ').slice(0, 160);
+  } finally { _pinAnswers.delete(cb.id); }
+
+  const after = await getDoc(env, kind === 'order' ? `orders/${id}` : `walletTopups/${id}`);
+  const st = after ? after.fields.status : '';
+  const done = act === 'confirm' ? (st && st !== 'Pending') : (st === 'Fail' || st === 'Rejected');
+  return corsJsonAdmin({ ok: !!done, status: st, note, error: done ? '' : (note || 'Not changed - open the panel') });
+}
+
+// One Telegram line when EVERY registered device failed (at most one per 10 minutes, so a bad token can't spam).
+let _pushFallbackAt = 0;
+async function adminPushTelegramFallback(env, title, body, typeKey) {
+  try {
+    if (!env.TELEGRAM_CHAT_ID || !env.TELEGRAM_BOT_TOKEN) return;
+    if (Date.now() - _pushFallbackAt < 10 * 60 * 1000) return;
+    _pushFallbackAt = Date.now();
+    await tgSendReliable(env, { chat_id: env.TELEGRAM_CHAT_ID, parse_mode: 'HTML',
+      text: `⚠️ <b>Push noti မရောက်ပါ</b> (${esc(typeKey)})\n${esc(String(title))}\n${esc(String(body))}` });
+  } catch (e) { console.error('push telegram fallback failed', e); }
+}
+
 async function sendAdminPush(env, title, body, data = {}) {
-  const tokens = await getAdminDeviceTokens(env);
-  for (const token of tokens) {
-    const send = await sendFcmPush(env, token, title, body, data);
+  const devices = await getAdminDevices(env);
+  if (!devices.length) return;
+  const typeKey = ADMIN_PUSH_TYPE_KEY[data.type] || 'order';
+  const big = data.big === true || data.big === '1';
+  // tag = how notifications stack on the phone: all new orders share one ("5 orders"), big orders stand alone.
+  const group = big ? 'big-' + (data.orderId || data.topupId || Date.now())
+    : data.type === 'order' ? 'orders'
+    : data.type === 'walletTopup' ? 'topups'
+    : data.type === 'supportChat' ? 'chat-' + (data.guestId || '')
+    : 'rem-' + (data.orderId || data.topupId || '');
+  const listUrl = (data.type === 'walletTopup' || data.topupId) ? '/?tab=topups' : data.type === 'supportChat' ? '/' : '/?tab=orders';
+  const itemUrl = data.orderId ? '/?order=' + encodeURIComponent(data.orderId)
+    : data.topupId ? '/?topup=' + encodeURIComponent(data.topupId) : listUrl;
+  // Action buttons (Confirm / Reject) only for a single order / top-up that is below the PIN threshold.
+  const actKind = data.orderId ? 'order' : data.topupId ? 'topup' : '';
+  const actId = String(data.orderId || data.topupId || '');
+  const canAct = !!actKind && !big && ['order', 'walletTopup', 'reminder'].includes(data.type);
+  let sent = 0, failed = 0, skipped = 0, quietCount = 0;
+  const devs = [];
+  for (const dev of devices.slice()) {
+    const prefs = dev.f.prefs;
+    const label = String(dev.f.device || 'Device').slice(0, 24), who = String(dev.f.username || '').slice(0, 20);
+    if (prefs && typeof prefs === 'object' && prefs[typeKey] === false) { skipped++; devs.push({ d: label, u: who, r: 'skip' }); continue; }
+    const quiet = inQuietHours(dev.f);
+    if (quiet) quietCount++;
+    const payload = { ...data, kind: typeKey, url: itemUrl, listUrl, tag: group, big: big ? '1' : '0', silent: quiet ? '1' : '0' };
+    if (canAct) {
+      const exp = Date.now() + PUSH_ACTION_TTL_MS;
+      const sig = await pushActionSig(env, actKind, actId, dev.id, exp);
+      if (sig) Object.assign(payload, { act: '1', ak: actKind, aid: actId, dev: dev.id, exp: String(exp), sig });
+    }
+    const send = await sendFcmPush(env, dev.id, title, body, payload, '', { dataOnly: true });
     const errStatus = send && !send.ok && send.result && send.result.error && send.result.error.status;
+    if (send && send.ok) sent++; else failed++;
+    devs.push({ d: label, u: who, r: (send && send.ok) ? (quiet ? 'quiet' : 'ok') : 'fail', ...(errStatus ? { e: String(errStatus).slice(0, 24) } : {}) });
     if (errStatus === 'NOT_FOUND' || errStatus === 'INVALID_ARGUMENT') {
-      // Dead token (device unregistered/site data cleared) - drop it so
-      // future ticks stop wasting a call on it.
-      try { await deleteFirestoreDoc(env, `adminDevices/${token}`); } catch (e) { /* not fatal */ }
-      _adminDevicesCache = _adminDevicesCache.filter(t => t !== token);
+      // Dead token (device unregistered/site data cleared) - drop it so future ticks stop wasting a call on it.
+      try { await deleteFirestoreDoc(env, `adminDevices/${dev.id}`); } catch (e) { /* not fatal */ }
+      _adminDevicesCache = _adminDevicesCache.filter(x => x.id !== dev.id);
     }
   }
+  if (sent + failed > 0) await logAdminPush(env, { title: String(title).slice(0, 80), type: typeKey, sent, failed, skipped, quiet: quietCount, big, devs: devs.slice(0, 6) });
+  if (sent === 0 && failed > 0) await adminPushTelegramFallback(env, title, body, typeKey);
+}
+
+// "Test noti" button in the admin panel: sends a data-only push to ONE device token. Admin ID token required.
+async function handleAdminTestPush(request, env) {
+  const admin = await pinAdminFromRequest(request, env);
+  if (!admin) return corsJsonAdmin({ ok: false, error: 'Not authorised' }, 401);
+  let body = {};
+  try { body = await request.json(); } catch (e) { /* empty */ }
+  const token = typeof body.token === 'string' ? body.token : '';
+  if (!token || token.length > 4096) return corsJsonAdmin({ ok: false, error: 'No device token' }, 400);
+  const send = await sendFcmPush(env, token, 'LINN Admin ✅', 'Test noti — ဒီစာမြင်ရရင် Push အလုပ်လုပ်နေပါပြီ',
+    { type: 'test', kind: 'test', url: '/', listUrl: '/', tag: 'test', big: '0', silent: '0' }, '', { dataOnly: true });
+  if (send && send.ok) return corsJsonAdmin({ ok: true });
+  const st = send && send.result && send.result.error && send.result.error.status;
+  return corsJsonAdmin({ ok: false, error: st || 'FCM error' }, 502);
+}
+
+// Order / top-up still Pending after 10 and again after 30 minutes -> reminder push.
+// Reads nothing extra unless something is actually overdue; counts live in settings/adminPendingReminders.
+const REMIND_AFTER_MIN = [10, 30];
+const _remindedTwice = new Set();
+async function remindStalePending(env, orders, topups) {
+  const now = Date.now();
+  const cand = [];
+  const consider = (kind, d) => {
+    const f = d.fields || {};
+    if (f.status !== 'Pending' || !f.telegramMessageId || f.paidFromWallet === true) return;
+    const created = new Date(f.timestamp || f.createdAt || 0).getTime();
+    if (!created) return;
+    cand.push({ kind, d, ageMin: (now - created) / 60000 });
+  };
+  (orders || []).forEach(d => consider('order', d));
+  (topups || []).forEach(d => consider('topup', d));
+  const due = cand.filter(c => c.ageMin >= REMIND_AFTER_MIN[0] && !_remindedTwice.has(c.d.id));
+  if (!due.length) return;
+  if (subrequestsLeft(env) < 15) return;
+  const stDoc = await getDoc(env, 'settings/adminPendingReminders');
+  const counts = (stDoc && stDoc.fields.counts && typeof stDoc.fields.counts === 'object') ? { ...stDoc.fields.counts } : {};
+  let changed = false, sent = 0;
+  for (const c of due) {
+    const n = Number(counts[c.d.id] || 0);
+    if (n >= REMIND_AFTER_MIN.length) { _remindedTwice.add(c.d.id); continue; }
+    if (c.ageMin < REMIND_AFTER_MIN[n]) continue;
+    if (sent >= 2 || subrequestsLeft(env) < 12) break;
+    const f = c.d.fields, mins = Math.floor(c.ageMin);
+    if (c.kind === 'order') {
+      await sendAdminPush(env, `⏰ Order ${mins} မိနစ်ရှိပြီ`,
+        `${f.game || 'Order'} — ${Number(f.price || 0).toLocaleString()} MMK မကိုင်ရသေးပါ`, { type: 'reminder', orderId: c.d.id });
+    } else {
+      await sendAdminPush(env, `⏰ Top Up ${mins} မိနစ်ရှိပြီ`,
+        `${Number(f.amount || 0).toLocaleString()} MMK မကိုင်ရသေးပါ`, { type: 'reminder', topupId: c.d.id });
+    }
+    counts[c.d.id] = n + 1; changed = true; sent++;
+    if (n + 1 >= REMIND_AFTER_MIN.length) _remindedTwice.add(c.d.id);
+  }
+  const live = new Set(cand.map(c => c.d.id));
+  for (const k of Object.keys(counts)) if (!live.has(k)) { delete counts[k]; changed = true; }
+  if (changed) await patchDoc(env, 'settings/adminPendingReminders', { counts }, ['counts']);
 }
 
 // Catches every order that resolved to Success/Fail WITHOUT going through
@@ -5111,8 +5475,10 @@ async function runCronSweepSteps(env, minute) {
     return;
   }
   // Independent: an orders-sweep failure (e.g. Firestore query error) must not skip the wallet top-up cards.
-  try { await sweepCollection(env, 'orders', buildOrderMessage); } catch (e) { console.error('orders sweep failed', e); }
-  try { await sweepCollection(env, 'walletTopups', buildTopupMessage); } catch (e) { console.error('walletTopups sweep failed', e); }
+  let _pendOrders = [], _pendTopups = [];
+  try { _pendOrders = (await sweepCollection(env, 'orders', buildOrderMessage)) || []; } catch (e) { console.error('orders sweep failed', e); }
+  try { _pendTopups = (await sweepCollection(env, 'walletTopups', buildTopupMessage)) || []; } catch (e) { console.error('walletTopups sweep failed', e); }
+  try { await remindStalePending(env, _pendOrders, _pendTopups); } catch (e) { console.error('remindStalePending failed', e); }
   // Essentials above (cards). Wallet-order fulfilment is customer-facing, so it also stays on every even tick.
   try { await fulfillWalletOrders(env); } catch (e) { console.error('fulfillWalletOrders failed', e); }
   try { await recoverUnchargedWalletOrders(env); } catch (e) { console.error('recoverUnchargedWalletOrders failed', e); }
@@ -5126,7 +5492,7 @@ try { await reconcileWalletHolds(env); } catch (e) { console.error('reconcileWal
     async () => { await pollPendingG2BulkGameOrders(env); },
     async () => { await pollPendingG2BulkGameOrders(env); },   // 2nd slot: G2Bulk fallback poll now runs about every 10 min
     async () => { await sweepSupportTickets(env); await sweepNotificationBroadcasts(env); },
-    async () => { await sweepUnnotifiedOrderPushes(env); await sweepStuckProcessingOrders(env); },
+    async () => { await sweepUnnotifiedOrderPushes(env); await sweepUnnotifiedTopupPushes(env); await sweepStuckProcessingOrders(env); },
     async () => { await runAutoTransferSweep(env); },
     async () => { await checkDailySummarySchedule(env); await checkWeeklySummarySchedule(env); },
     async () => { await runFirestoreBackupSweep(env); },
@@ -5523,6 +5889,7 @@ async function handleTopupCreate(request, env, ctx) {
   if (!id) { await releaseReceipt(env, rv); return topupJson(request, { ok: false, error: 'Could not save the request. Please try again.' }, 500); }
 
   if (rv.payin && rv.payin.id) ctx.waitUntil(patchDoc(env, `incomingPayments/${rv.payin.id}`, { usedBy: `walletTopups/${id}` }, ['usedBy']).catch(() => {}));
+  ctx.waitUntil(notifyTopupReceived(env, id, userId, amount));
   // Same instant-card path /ping uses; the cron sweep is the safety net.
   ctx.waitUntil((async () => {
     try {
@@ -5701,8 +6068,21 @@ async function handleProfile(request, env) {
     return topupJson(request, { ok: true });
   }
 
+  if (op === 'push' && body.prefs && typeof body.prefs === 'object') {
+    const pr = { order: body.prefs.order !== false, wallet: body.prefs.wallet !== false, promo: body.prefs.promo !== false };
+    await patchDoc(env, path, { guestId: userId, pushPrefs: pr }, ['guestId', 'pushPrefs']);
+    return topupJson(request, { ok: true });
+  }
+
+  if (op === 'push' && body.lang && body.token === undefined) {
+    // language-only update (customer switched the app language)
+    await patchDoc(env, path, { guestId: userId, pushLang: body.lang === 'my' ? 'my' : 'en' }, ['guestId', 'pushLang']);
+    return topupJson(request, { ok: true });
+  }
+
   if (op === 'push') {
     const token = body.token == null ? '' : String(body.token);
+    if (token && body.lang) await patchDoc(env, path, { pushLang: body.lang === 'my' ? 'my' : 'en' }, ['pushLang']);
     if (token.length > 4096) return topupJson(request, { ok: false, error: 'Invalid token.' }, 400);
     if (token) await patchDoc(env, path, { guestId: userId, fcmToken: token }, ['guestId', 'fcmToken']);
     else if (acc.user) await patchDoc(env, path, {}, ['fcmToken']); // field in mask but not in body = delete it
@@ -6113,8 +6493,12 @@ async function sweepNotificationBroadcasts(env) {
   let stopId = '', stopOffset = 0;
   outer:
   for (const n of newNotifs) {
-    const title = n.fields.title || 'Linn Game Store';
-    const body = n.fields.intro || n.fields.message || '';
+    // Scheduled for later (admin picked a send time): leave it for a future tick.
+    if (n.fields.timestamp && Date.parse(n.fields.timestamp) > Date.now()) continue;
+    const titleEn = n.fields.title || 'Linn Game Store';
+    const bodyEn = n.fields.intro || n.fields.message || '';
+    // optional Burmese version: admin can add titleMy / introMy on the notification doc
+    const titleMy = n.fields.titleMy || '', bodyMy = n.fields.introMy || '';
     let recipients;
     if (n.fields.targetUserId) {
       const userDoc = await getDoc(env, `users/${n.fields.targetUserId}`);
@@ -6125,7 +6509,10 @@ async function sweepNotificationBroadcasts(env) {
     for (let i = (n.id === resumeId ? resumeOffset : 0); i < recipients.length; i++) {
       if (subrequestsLeft(env) <= RESERVE) { stopId = n.id; stopOffset = i; break outer; }
       const u = recipients[i];
-      const send = await sendFcmPush(env, u.fields.fcmToken, title, body, { notifId: n.id }, (typeof n.fields.imageUrl === 'string' && /^https:\/\//i.test(n.fields.imageUrl)) ? n.fields.imageUrl : '');
+      if (u.fields.pushPrefs && typeof u.fields.pushPrefs === 'object' && u.fields.pushPrefs.promo === false) continue; // customer turned promo alerts off
+      const wantMy = u.fields.pushLang === 'my' && (titleMy || bodyMy);
+      const title = wantMy ? (titleMy || titleEn) : titleEn, body = wantMy ? (bodyMy || bodyEn) : bodyEn;
+      const send = await sendFcmPush(env, u.fields.fcmToken, title, body, { notifId: n.id }, (typeof n.fields.imageUrl === 'string' && /^https:\/\//i.test(n.fields.imageUrl)) ? n.fields.imageUrl : ''), { icon: '/noti-promo.png' };
       const errStatus = send && !send.ok && send.result && send.result.error && send.result.error.status;
       if (errStatus === 'NOT_FOUND' || errStatus === 'INVALID_ARGUMENT') {
         await patchDoc(env, `users/${u.id}`, { fcmToken: null }, ['fcmToken']);
@@ -6383,6 +6770,7 @@ async function sweepCollection(env, collectionId, buildMessage) {
     try { await processPendingCard(env, collectionId, d, buildMessage, shared); }
     catch (err) { console.error('sweepCollection: card failed, continuing', collectionId, d && d.id, err); }
   }
+  return docs;
 }
 
 // One Pending order / top-up -> its Telegram card. Used by the cron sweep AND by the instant /ping fast path
@@ -6451,13 +6839,15 @@ async function processPendingCard(env, collectionId, d, buildMessage, shared, op
     // even with both the admin panel and Telegram closed.
     const pushP = (async () => {
     if (collectionId === 'orders') {
-      await sendAdminPush(env, 'New Order 🛒',
+      const _bigO = Number(d.fields.price || 0) >= PIN_AMOUNT_THRESHOLD;
+      await sendAdminPush(env, _bigO ? '🔥 Big Order' : 'New Order 🛒',
         `${d.fields.game || 'Order'} — ${Number(d.fields.price || 0).toLocaleString()} MMK`,
-        { type: 'order', orderId: d.id });
+        { type: 'order', orderId: d.id, big: _bigO });
     } else if (collectionId === 'walletTopups') {
-      await sendAdminPush(env, 'Wallet Top Up 💰',
+      const _bigT = Number(d.fields.amount || 0) >= PIN_AMOUNT_THRESHOLD;
+      await sendAdminPush(env, _bigT ? '🔥 Big Top Up' : 'Wallet Top Up 💰',
         `${Number(d.fields.amount || 0).toLocaleString()} MMK requested`,
-        { type: 'walletTopup', topupId: d.id });
+        { type: 'walletTopup', topupId: d.id, big: _bigT });
     }
     })().catch(e => console.error('admin push failed', e));
 
@@ -9305,6 +9695,7 @@ async function creditWalletTopup(env, topupId, doc) {
     walletIncrementWrite(env, userPath, Math.round(amount))
   ]);
   if (creditResult.error) throw new Error('Could not credit the wallet (request changed - try again).');
+  try { await notifyTopupCompleted(env, topupId, doc.fields); } catch (e) { console.error('topup push failed', e); }
   return amount;
 }
 
@@ -11027,6 +11418,7 @@ async function handleOrderCreate(request, env, ctx) {
   // Customer's own Telegram (only if they linked it): the order card arrives right away as Pending and is
   // then edited live (Processing -> Completed / Failed). Runs BEFORE the sweep/card below because both
   // notifyOrderDm and the fulfilment claim use an updateTime precondition on the same order doc.
+  if (!wallet) ctx.waitUntil(notifyOrderReceived(env, id, { ...doc, userId }));
   const dmPending = async () => {
     try { await notifyOrderDm(env, id, { ...doc }, 'Pending'); }
     catch (e) { console.error('order Pending DM failed', id, e); }
