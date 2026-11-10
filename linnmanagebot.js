@@ -2078,7 +2078,7 @@ async function notifyOrderStatus(env, orderId, status, preloadedOrderDoc = null)
     const send = await sendFcmPush(env, fcmToken, title, body, { orderId, status }, _img,
       { link: storeLink(env, '?order=' + encodeURIComponent(orderId)), icon: status === 'Success' ? '/noti-success.png' : '/noti-fail.png' });
     const errStatus = send && !send.ok && send.result && send.result.error && send.result.error.status;
-    if (errStatus === 'NOT_FOUND' || errStatus === 'INVALID_ARGUMENT') {
+    if (errStatus === 'NOT_FOUND') {
       await patchDoc(env, `users/${orderDoc.fields.userId}`, { fcmToken: null }, ['fcmToken']);
     }
   } catch (err) {
@@ -2120,7 +2120,7 @@ async function notifyOrderReceived(env, orderId, o) {
       my ? `🎮 ${game}${item} — စစ်ဆေးပြီး မကြာခင် ဖြည့်ပေးပါမယ်။` : `🎮 ${game}${item} — we're checking it and will deliver shortly.`,
       { orderId, status: 'Pending' }, '', { link: storeLink(env, '?order=' + encodeURIComponent(orderId)), icon: '/noti-pending.png' });
     const es = send && !send.ok && send.result && send.result.error && send.result.error.status;
-    if (es === 'NOT_FOUND' || es === 'INVALID_ARGUMENT') await patchDoc(env, `users/${o.userId}`, { fcmToken: null }, ['fcmToken']);
+    if (es === 'NOT_FOUND') await patchDoc(env, `users/${o.userId}`, { fcmToken: null }, ['fcmToken']);
   } catch (err) { console.error('notifyOrderReceived error', orderId, err); }
 }
 async function notifyTopupReceived(env, topupId, userId, amount) {
@@ -2137,7 +2137,7 @@ async function notifyTopupReceived(env, topupId, userId, amount) {
       my ? `💰 ${amt} MMK တောင်းဆိုမှု ရရှိပါပြီ။ စစ်ဆေးနေပါတယ်။` : `💰 ${amt} MMK request received. We're checking it now.`,
       { topupId, kind: 'wallet' }, '', { link: storeLink(env, '?page=wallet'), icon: '/noti-pending.png' });
     const es = send && !send.ok && send.result && send.result.error && send.result.error.status;
-    if (es === 'NOT_FOUND' || es === 'INVALID_ARGUMENT') await patchDoc(env, `users/${userId}`, { fcmToken: null }, ['fcmToken']);
+    if (es === 'NOT_FOUND') await patchDoc(env, `users/${userId}`, { fcmToken: null }, ['fcmToken']);
   } catch (err) { console.error('notifyTopupReceived error', topupId, err); }
 }
 
@@ -2161,7 +2161,7 @@ async function notifyTopupCompleted(env, topupId, topupFields) {
       myT ? `💰 ${amt.toLocaleString()} MMK ကို သင့် Wallet ထဲ ထည့်ပြီးပါပြီ။` : `💰 ${amt.toLocaleString()} MMK has been added to your Wallet.`, { topupId, kind: 'wallet' }, '',
       { link: storeLink(env, '?page=wallet'), icon: '/noti-wallet.png' });
     const errStatus = send && !send.ok && send.result && send.result.error && send.result.error.status;
-    if (errStatus === 'NOT_FOUND' || errStatus === 'INVALID_ARGUMENT') {
+    if (errStatus === 'NOT_FOUND') {
       await patchDoc(env, `users/${userId}`, { fcmToken: null }, ['fcmToken']);
     }
   } catch (err) { console.error('notifyTopupCompleted error', topupId, err); }
@@ -6544,7 +6544,7 @@ async function sweepNotificationBroadcasts(env) {
       const send = await sendFcmPush(env, u.fields.fcmToken, title, body, { notifId: n.id }, (typeof n.fields.imageUrl === 'string' && /^https:\/\//i.test(n.fields.imageUrl)) ? n.fields.imageUrl : '', { icon: '/noti-promo.png' });
       const errStatus = send && !send.ok && send.result && send.result.error && send.result.error.status;
       console.log('[broadcast] push', n.id, 'user', u.id, send ? (send.ok ? 'OK' : 'FAIL ' + errStatus) : 'NO-RESPONSE');
-      if (errStatus === 'NOT_FOUND' || errStatus === 'INVALID_ARGUMENT') {
+      if (errStatus === 'NOT_FOUND') {
         await patchDoc(env, `users/${u.id}`, { fcmToken: null }, ['fcmToken']);
       }
     }
