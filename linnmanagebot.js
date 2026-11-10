@@ -774,6 +774,16 @@ export default {
       }
     }
 
+    // Admin panel "Send notification": push the just-saved notification to customers right away
+    // (instead of waiting for the next cron slot). Admin ID token required.
+    if (url.pathname === '/admin-broadcast-now') {
+      if (request.method === 'OPTIONS') return corsPreflightAdmin();
+      if (request.method === 'POST') {
+        try { return await handleAdminBroadcastNow(request, env); }
+        catch (err) { console.error('/admin-broadcast-now failed', err); return corsJsonAdmin({ ok: false, error: 'Server error' }, 500); }
+      }
+    }
+
     // Confirm / Reject tapped on a phone notification (service worker calls this; signed one-time-style token, no login).
     if (url.pathname === '/admin-push-action') {
       if (request.method === 'OPTIONS') return corsPreflightAdmin();
@@ -2353,6 +2363,23 @@ async function sendAdminPush(env, title, body, data = {}) {
   }
   if (sent + failed > 0) await logAdminPush(env, { title: String(title).slice(0, 80), type: typeKey, sent, failed, skipped, quiet: quietCount, big, devs: devs.slice(0, 6) });
   if (sent === 0 && failed > 0) await adminPushTelegramFallback(env, title, body, typeKey);
+}
+
+// Runs the customer-notification broadcast sweep right now (same code the cron slot runs), under the
+// shared cron lock so it can never overlap a cron tick and double-send. Anything it cannot finish in
+// one run (free-plan subrequest cap) is resumed by the cron via settings/telegramNotifBroadcastSweep.
+async function handleAdminBroadcastNow(request, env) {
+  const admin = await pinAdminFromRequest(request, env);
+  if (!admin) return corsJsonAdmin({ ok: false, error: 'Not authorised' }, 401);
+  for (let attempt = 0; attempt < 6; attempt++) {
+    if (await acquireCronLock(env)) {
+      try { await sweepNotificationBroadcasts(env); }
+      finally { await releaseCronLock(env); }
+      return corsJsonAdmin({ ok: true });
+    }
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return corsJsonAdmin({ ok: true, queued: true }); // cron is busy - the next cron slot sends it
 }
 
 // "Test noti" button in the admin panel: sends a data-only push to ONE device token. Admin ID token required.
