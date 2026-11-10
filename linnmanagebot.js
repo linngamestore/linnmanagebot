@@ -6483,10 +6483,12 @@ async function sweepNotificationBroadcasts(env) {
   }
 
   const newNotifs = await queryDocsSince(env, 'notifications', 'timestamp', lastRunIso);
+  console.log('[broadcast] since', lastRunIso, '-> new notifications:', newNotifs.length);
   if (!newNotifs.length) return;
 
   const needsAllUsers = newNotifs.some(n => !n.fields.targetUserId);
   const tokenOwners = needsAllUsers ? (await queryAllDocs(env, 'users')).filter(u => u.fields.fcmToken) : [];
+  console.log('[broadcast] users with fcmToken:', tokenOwners.length, '| scheduled-later ids:', newNotifs.filter(n => n.fields.timestamp && Date.parse(n.fields.timestamp) > Date.now()).map(n => n.id).join(',') || 'none');
 
   const RESERVE = 6; // keep a few subrequests for the state write + token cleanup
   let doneIso = lastRunIso;   // timestamp of the last notification that was FULLY delivered
@@ -6514,6 +6516,7 @@ async function sweepNotificationBroadcasts(env) {
       const title = wantMy ? (titleMy || titleEn) : titleEn, body = wantMy ? (bodyMy || bodyEn) : bodyEn;
       const send = await sendFcmPush(env, u.fields.fcmToken, title, body, { notifId: n.id }, (typeof n.fields.imageUrl === 'string' && /^https:\/\//i.test(n.fields.imageUrl)) ? n.fields.imageUrl : '', { icon: '/noti-promo.png' });
       const errStatus = send && !send.ok && send.result && send.result.error && send.result.error.status;
+      console.log('[broadcast] push', n.id, 'user', u.id, send ? (send.ok ? 'OK' : 'FAIL ' + errStatus) : 'NO-RESPONSE');
       if (errStatus === 'NOT_FOUND' || errStatus === 'INVALID_ARGUMENT') {
         await patchDoc(env, `users/${u.id}`, { fcmToken: null }, ['fcmToken']);
       }
