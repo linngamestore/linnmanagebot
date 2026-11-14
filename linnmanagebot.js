@@ -1222,6 +1222,31 @@ async function handleAdminUsers(request, env) {
     return J({ ok: true, users });
   }
 
+  // One page per call (client loops with the returned cursor): bans every account whose id is not a LINN id.
+  if (op === 'banNonLinn') {
+    const q = { from: [{ collectionId: 'users' }], orderBy: [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }], limit: 40 };
+    const cursor = String(body.cursor || '');
+    if (cursor) {
+      if (!STORE_ID_RE.test(cursor)) return J({ ok: false, error: 'Invalid cursor' }, 400);
+      q.startAt = { values: [{ referenceValue: docName(env, `users/${cursor}`) }], before: false };
+    }
+    const rows = await fsRun(env, 'runQuery', { structuredQuery: q });
+    if (!rows) return J({ ok: false, error: 'Could not read users' }, 500);
+    const docs = rows.filter(r => r.document);
+    const writes = [];
+    docs.forEach(r => {
+      const id = r.document.name.split('/').pop(), f = r.document.fields || {};
+      if (LINN_ID_RE.test(id) || (f.banned && f.banned.booleanValue === true)) return;
+      writes.push({
+        update: { name: docName(env, `users/${id}`), fields: { banned: { booleanValue: true }, bannedReason: { stringValue: NON_LINN_BAN_REASON } } },
+        updateMask: { fieldPaths: ['banned', 'bannedReason'] }
+      });
+    });
+    if (writes.length) { const res = await commitWrites(env, writes); if (res && res.error) return J({ ok: false, error: 'Could not ban' }, 500); }
+    const last = docs.length ? docs[docs.length - 1].document.name.split('/').pop() : null;
+    return J({ ok: true, banned: writes.length, scanned: docs.length, next: docs.length === 40 ? last : null });
+  }
+
   if (op === 'list') {
     const pageSize = Math.max(1, Math.min(500, parseInt(body.pageSize, 10) || 300));
     const q = { from: [{ collectionId: 'users' }], orderBy: [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }], limit: pageSize };
@@ -6016,6 +6041,7 @@ function cleanBlock(v, max) { return String(v == null ? '' : v).replace(/[\u0000
 // proven owner may touch it.
 async function profileDocAccess(env, uid, userId) {
   const user = await getDoc(env, `users/${userId}`);
+  if (!LINN_ID_RE.test(String(userId))) { await banNonLinnAccount(env, String(userId), user); return { ok: false, status: 403, reason: 'Your account has been restricted.' }; }
   if (!user) return { ok: true, user: null };
   const f = user.fields;
   if (f.banned) return { ok: false, status: 403, reason: 'Your account has been restricted.' };
@@ -6078,6 +6104,35 @@ async function handleProfile(request, env) {
     if (!acc.user) return topupJson(request, { ok: true });
     await patchDoc(env, path, { lastSeen: now, online: body.leaving !== true }, ['lastSeen', 'online']);
     return topupJson(request, { ok: true });
+  }
+
+  // Location on login. Always records the network-based location Cloudflare derives from the IP (city level, no
+  // permission needed); a precise GPS fix is stored only when the customer allowed it in the browser prompt and the
+  // browser sent it. Raw IP addresses are not stored here.
+  if (op === 'location') {
+    if (!acc.user) return topupJson(request, { ok: true });
+    const cf = request.cf || {};
+    const cl = (v, n) => cleanLine(v, n);
+    const rng = (v, lo, hi) => { const n = Number(v); return Number.isFinite(n) && n >= lo && n <= hi ? n : null; };
+    const geo = { source: 'ip', at: now };
+    if (cf.country) geo.country = cl(cf.country, 8);
+    if (cf.region) geo.region = cl(cf.region, 80);
+    if (cf.city) geo.city = cl(cf.city, 80);
+    if (cf.postalCode) geo.postal = cl(cf.postalCode, 16);
+    if (cf.timezone) geo.tz = cl(cf.timezone, 60);
+    if (cf.asOrganization) geo.isp = cl(cf.asOrganization, 80);
+    const la = rng(cf.latitude, -90, 90), lo = rng(cf.longitude, -180, 180);
+    if (la !== null && lo !== null) { geo.lat = la; geo.lng = lo; }
+    const fields = { guestId: userId, lastLoginAt: now, loginGeo: geo };
+    const mask = ['guestId', 'lastLoginAt', 'loginGeo'];
+    const gla = rng(body.lat, -90, 90), glo = rng(body.lng, -180, 180);
+    if (gla !== null && glo !== null && body.lat !== '' && body.lng !== '') {
+      const acr = rng(body.accuracy, 0, 100000);
+      fields.lastLocation = { lat: gla, lng: glo, accuracy: acr === null ? null : Math.round(acr), source: 'gps', at: now };
+      mask.push('lastLocation');
+    }
+    await patchDoc(env, path, fields, mask);
+    return topupJson(request, { ok: true, precise: mask.includes('lastLocation') });
   }
 
   if (op === 'favorite') {
@@ -7504,11 +7559,23 @@ function walletIncrementWrite(env, userPath, amount, userUpdateTime) {
 // Who owns this wallet order? Not the browser's word for it: the order carries
 // authUid (rules force it to equal the real signed-in uid), and that account's
 // Firebase Auth e-mail must match the e-mail stored on the wallet's users doc.
+// Only real LINN accounts (LINN-XXXXXXXX, made by /account/create) may do anything. Any other id (for example a bare
+// Firebase uid from the old browser-side create) is banned on first contact and refused everywhere.
+const LINN_ID_RE = /^LINN-[A-Za-z0-9]{4,}$/;
+const NON_LINN_BAN_REASON = 'Account ID is not a LINN ID';
+async function banNonLinnAccount(env, userId, user) {
+  try {
+    if (user && user.fields && !user.fields.banned) {
+      await patchDoc(env, `users/${userId}`, { banned: true, bannedReason: NON_LINN_BAN_REASON }, ['banned', 'bannedReason']);
+    }
+  } catch (e) { console.error('banNonLinnAccount failed', userId, e); }
+}
 async function verifyWalletOwner(env, f) {
   if (!f.authUid || !f.userId) return { ok: false, reason: 'Missing account identity.' };
   const uid = String(f.authUid);
   const user = await getDoc(env, `users/${f.userId}`);
   if (!user) return { ok: false, reason: 'Wallet account not found.' };
+  if (!LINN_ID_RE.test(String(f.userId))) { await banNonLinnAccount(env, String(f.userId), user); return { ok: false, reason: 'Your account has been restricted.' }; }
   if (user.fields.banned) return { ok: false, reason: 'Your account has been restricted.' };
 
   // Telegram login: Firebase custom-token uid is `tg_<telegramId>` and the
@@ -11900,6 +11967,10 @@ const _ipBanCache = new Map(); // ip -> banned-until ms (per isolate)
 function safeIpKey(ip) { return String(ip || 'unknown').replace(/[^a-zA-Z0-9:.]/g, '_').slice(0, 64); }
 
 async function ipBanned(env, request) {
+  // IP bans are switched off: shared / carrier / Safari Private Relay IPs locked out real customers.
+  // Account and identity bans (gmail / telegram) still apply.
+  return false;
+  // eslint-disable-next-line no-unreachable
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const hit = _ipBanCache.get(ip);
   if (hit && hit.checkedAt > Date.now() - 60000) return hit.until > Date.now();
@@ -11957,12 +12028,7 @@ async function recordGuestViolation(request, env, route, kind, claimedUserId, ui
     if (!claimed) { try { const b = await request.clone().json(); claimed = String((b && b.userId) || ''); } catch (e) { /* no body */ } }
     if (!STORE_ID_RE.test(claimed)) claimed = '';
 
-    const over = await rateLimitHit(env, 'guestViolation', ip, 3, 3600);
-    if (over) {
-      const until = Date.now() + 24 * 3600 * 1000;
-      await patchDoc(env, `bannedIps/${safeIpKey(ip)}`, { ip, until, at: new Date(), reason: kind }, ['ip', 'until', 'at', 'reason']);
-      _ipBanCache.set(ip, { until, checkedAt: Date.now() });
-    }
+    const over = false;   // IP bans are off: violations are only logged / alerted, an IP is never blocked
     await auditLog(env, 'guest_violation', ip, { route, kind, claimedUserId: claimed, uid: String(uid || ''), ipBanned: over });
 
     if (await rateLimitHit(env, 'guestAlert', ip, 3, 3600)) return; // don't spam the chat
